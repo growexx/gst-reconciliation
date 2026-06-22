@@ -1,0 +1,32 @@
+{
+  "name": "gst-reco-standalone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Standalone GST 2A/2B reconciliation + unmatched bills (MongoDB, JWT). AP-invoice (RBKP) data is ingested from the client.",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "server": "node server/server.js",
+    "server:dev": "nodemon server/server.js",
+    "client": "cd client && npm run dev",
+    "dev": "concurrently \"npm run server:dev\" \"npm run client\"",
+    "seed:user": "node server/scripts/seedUser.js",
+    "load:sap": "node --max-old-space-size=8192 server/scripts/loadSapData.js",
+    "build": "cd client && npm ci && npm run build",
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^7.2.0",
+    "multer": "^2.1.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.1.7"
+  }
+}

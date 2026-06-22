@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Secrets / environment (NEVER commit) — .env.example is kept as the template
+.env
+.env.local
+
+# Build output
+client/dist/
+dist/
+
+# Excel data files (sensitive financial / vendor data — do not commit)
+*.xlsx
+*.xls
+~$*
+
+# Claude + local analysis scripts (not part of the app)
+.claude/
+analysis/
+
+# Generated docs / scratch
+docs/
+
+# Logs / temp
+*.log
+tmp/
