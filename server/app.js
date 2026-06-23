@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 
@@ -20,14 +21,26 @@ app.get('/api/companies', (req, res) =>
 app.get('/api/health', (req, res) =>
     res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// ── Serve the built frontend (client/dist) in production ──
+// ── Serve the built frontend (client/dist) only when it's bundled with the
+//    server (combined deployment). When the frontend is deployed separately the
+//    dist isn't present, so we skip static serving instead of erroring on a
+//    missing index.html for every non-API request. ──
 const DIST_PATH = path.join(__dirname, '..', 'client', 'dist');
-app.use(express.static(DIST_PATH));
-app.get('*', (req, res) => {
-    if (!req.path.startsWith('/api')) {
-        res.sendFile(path.join(DIST_PATH, 'index.html'));
-    }
-});
+const INDEX_HTML = path.join(DIST_PATH, 'index.html');
+
+if (fs.existsSync(INDEX_HTML)) {
+    app.use(express.static(DIST_PATH));
+    app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api')) return next();
+        res.sendFile(INDEX_HTML);
+    });
+} else {
+    // Backend-only deployment: there is no frontend to serve here.
+    app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api')) return next();
+        res.status(404).json({ message: 'Not found. This is the API server.' });
+    });
+}
 
 // ── Error handler ──
 app.use((err, req, res, next) => {
