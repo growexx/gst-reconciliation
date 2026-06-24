@@ -16,7 +16,7 @@
  * invoice-no + tax (tier T4), adopting the GSTIN from the 2B. The total tax
  * (cgst+sgst+igst from BSET) is what matching uses.
  *
- * Usage:  node server/scripts/loadSapData.js [--company COMP1] [--fresh]
+ * Usage:  node server/scripts/loadSapData.js [--company "Nandan Terry"] [--fresh]
  */
 require('dotenv').config({ path: require('path').join(__dirname, '..', '..', '.env') });
 const path = require('path');
@@ -27,7 +27,7 @@ const { normalizeInvoiceNum } = require('../modules/reconcile/matcher');
 const ROOT = process.env.SAP_DIR || path.resolve(__dirname, '..', '..');
 const NT = path.join(ROOT, 'NT Data');
 const arg = (name, def) => { const i = process.argv.indexOf(name); return i !== -1 && process.argv[i + 1] && !process.argv[i + 1].startsWith('--') ? process.argv[i + 1] : def; };
-const COMPANY = arg('--company', (process.env.COMPANIES || 'COMP1').split(',')[0].trim());
+const COMPANY = arg('--company', (process.env.COMPANIES || 'Nandan Terry').split(',')[0].trim());
 const FRESH = process.argv.includes('--fresh');
 
 // BKPF source (the agreed vendor-invoice source). Override via SAP_BKPF_FILE.
@@ -41,30 +41,59 @@ const LFA1_GST = { file: 'LFA1 DATA GST.xlsx', dir: ROOT };
 // Use the lean NT RBKP only (the BKPK workbook also carries a 159k-row BKPF sheet
 // that would blow memory when its workbook is opened).
 const RBKP_FILES = [{ file: 'RBKP Data.xlsx', dir: NT }];
-// Only genuine vendor INVOICES are loaded. KG (credit memos) and any other
-// document type are excluded — credit/debit notes belong to the 2B CDNR section,
-// not the B2B invoice reconciliation, so they must not sit in the AP-invoice pile.
-const VENDOR_TYPES = new Set(['RE', 'KR']);   // RE = MM invoice, KR = FI invoice
+// Document types loaded from BKPF, and which GSTR-2B section each reconciles against:
+//   RE = MM invoice, KR = FI invoice  -> B2B section   (vendor invoices)
+//   KG = credit/debit note            -> B2B-CDNR section
+//   SA = G/L document                 -> NONE (loaded for completeness, not reconciled yet)
+const VENDOR_TYPES = new Set(['RE', 'KR', 'KG', 'SA']);
+const DOC_CATEGORY = { RE: 'B2B', KR: 'B2B', KG: 'CDNR', SA: 'NONE' };
 
 function read({ file, dir, sheet }) {
-  const wb = XLSX.readFile(path.join(dir, file), { cellDates: true });
+  // NOTE: no { cellDates: true }. cellDates makes XLSX build Date objects by
+  // interpreting Excel serials in the machine's local timezone (IST), which
+  // shifts every date back ~5.5h (+a rounding error) — e.g. a Doc. Date of
+  // 01-05-2026 becomes 2026-04-30T18:29:50Z and reads as April. We instead keep
+  // the raw serial and decode it ourselves (see toDate), which is timezone-safe.
+  const wb = XLSX.readFile(path.join(dir, file));
   const sn = sheet && wb.Sheets[sheet] ? sheet : wb.SheetNames[0];
   return XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: null, blankrows: false });
 }
 const num = (v) => Number(v) || 0;
-const toDate = (v) => (v instanceof Date && !isNaN(v)) ? v : (v ? new Date(v) : null);
+// Decode an Excel date cell to the exact IST calendar date shown in SAP, anchored
+// at midnight so no timezone math can drift the day/month. Handles raw serials
+// (the normal path now that cellDates is off), Date objects, and dd/mm/yyyy or
+// ISO strings as fallbacks.
+const toDate = (v) => {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') {
+    const o = XLSX.SSF.parse_date_code(v);
+    return o ? new Date(Date.UTC(o.y, o.m - 1, o.d)) : null;
+  }
+  if (v instanceof Date) return isNaN(v) ? null : new Date(Date.UTC(v.getFullYear(), v.getMonth(), v.getDate()));
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})$/);   // dd/mm/yyyy (Indian)
+  if (m) return new Date(Date.UTC(+m[3], +m[2] - 1, +m[1]));
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);                    // ISO yyyy-mm-dd
+  if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+  return null;
+};
 const CGST = new Set(['JICG', 'JICR', 'JICN']);
 const SGST = new Set(['JISG', 'JISR', 'JISN']);
 const IGST = new Set(['JIIG', 'JIIR', 'JIIN']);
 
 // BSET: CGST/SGST/IGST per document, deduped across overlapping extracts.
+// Only the FORWARD GST conditions are summed — those have a transaction key (Trs)
+// starting 'JI' (JIC/JIS/JII). Reverse-charge offsets carry Trs 'JR' (JRC/JRS/JRI)
+// under condition types JICR/JISR/JIIR; counting them double-counts the tax on RCM
+// bills (forward + reverse), so they are excluded.
 function buildBsetSplit() {
   const map = new Map(); const seen = new Set();
   for (const src of BSET_FILES) {
     let rows; try { rows = read(src); } catch { continue; }
-    const H = rows[0]; const co = H.indexOf('CoCd'), d = H.indexOf('DocumentNo'), y = H.indexOf('Year'), it = H.indexOf('Itm'), cn = H.indexOf('CnTy'), am = H.indexOf('Amount');
+    const H = rows[0]; const co = H.indexOf('CoCd'), d = H.indexOf('DocumentNo'), y = H.indexOf('Year'), it = H.indexOf('Itm'), cn = H.indexOf('CnTy'), am = H.indexOf('Amount'), tr = H.indexOf('Trs');
     if (d < 0 || cn < 0 || am < 0) continue;
     for (const r of rows.slice(1)) {
+      if (tr >= 0 && !String(r[tr] || '').toUpperCase().startsWith('JI')) continue;  // forward GST only (skip JR% reverse)
       let comp; if (CGST.has(r[cn])) comp = 'cgst'; else if (SGST.has(r[cn])) comp = 'sgst'; else if (IGST.has(r[cn])) comp = 'igst'; else continue;
       const lk = `${r[co]}|${r[d]}|${r[y]}|${r[it]}|${r[cn]}`; if (seen.has(lk)) continue; seen.add(lk);
       const k = `${r[d]}|${r[y]}`; const o = map.get(k) || { cgst: 0, sgst: 0, igst: 0 }; o[comp] += num(r[am]); map.set(k, o);
@@ -143,7 +172,7 @@ function buildRbkpOnlyInvoices(bkpfRefs, vendorMaster) {
       const code = String(r[R.pty]); const vm = vendorMaster.get(code) || { gstin: '', name: '' };
       const docDate = toDate(r[R.docDate]);
       out.push({
-        companyId: COMPANY, source: 'RBKP', docType: 'RE',
+        companyId: COMPANY, source: 'RBKP', docType: 'RE', docCategory: 'B2B',
         docNo: `RBKP:${doc}`, fiscalYear: year,                 // prefixed so it can't collide with BKPF doc nos
         vendorCode: code, vendorName: vm.name || '', vendorGstin: vm.gstin || '', gstinSource: vm.gstin ? 'RBKP-master' : null,
         vendorRef: r[R.ref] != null ? String(r[R.ref]) : '', normalizedInvoiceNum: nref,
@@ -199,7 +228,7 @@ function buildBkpfInvoices(bsetSplit, vendorByDoc, vendorMaster, rbkpByRef) {
     stat.byType[type] = (stat.byType[type] || 0) + 1;
 
     out.push({
-      companyId: COMPANY, source: 'BKPF', docType: type,
+      companyId: COMPANY, source: 'BKPF', docType: type, docCategory: DOC_CATEGORY[type] || 'B2B',
       docNo: doc, fiscalYear: year,
       vendorCode: code, vendorName: vm.name || '', vendorGstin: vm.gstin || '', gstinSource,
       rbkpVendorCode, rbkpGstin, rbkpVendorName,           // stage-2 reserve
@@ -265,5 +294,13 @@ async function upsertVendors(vendorMaster) {
   const nInv = await upsertInvoices(invoices.concat(rbkpOnly));
   const nVen = await upsertVendors(vendorMaster);
   console.log(`✅ Upserted ${nInv} ap_invoices (source=BKPF) + ${nVen} vendors into "${process.env.MONGODB_DB || 'gst_reco'}".`);
+
+  // Re-apply manual reconciliations from the durable recon_log — this rebuild just
+  // wiped the on-invoice flags, so restore the user's manual matches (else those
+  // bills resurface as unmatched and re-gate a payment a human already cleared).
+  const reconcileService = require('../modules/reconcile/reconcileService');
+  const { applied } = await reconcileService.applyManualReconciliations(COMPANY);
+  console.log(`  re-applied ${applied} manual reconciliation(s) from recon_log.`);
+
   await disconnect();
 })().catch((e) => { console.error('ETL failed:', e); process.exit(1); });

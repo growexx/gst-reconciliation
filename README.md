@@ -63,7 +63,7 @@ cd client && npm install && cd ..
 cp .env.example .env          # then edit JWT_SECRET, MONGODB_URI, COMPANIES
 
 # 3. (optional) create a real login user
-npm run seed:user myuser mypassword COMP1
+npm run seed:user myuser mypassword "Nandan Terry"
 # if you skip this, the .env BOOTSTRAP_USER / BOOTSTRAP_PASS works once
 
 # 4. run (API + client together)

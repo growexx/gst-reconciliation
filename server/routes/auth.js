@@ -23,7 +23,7 @@ function verifyPassword(password, stored) {
 
 // GET /api/companies — list of companies for the login dropdown (from .env).
 router.get('/companies', (req, res) => {
-    const list = (process.env.COMPANIES || 'COMP1').split(',').map((s) => s.trim()).filter(Boolean);
+    const list = (process.env.COMPANIES || 'Nandan Terry').split(',').map((s) => s.trim()).filter(Boolean);
     res.json({ companies: list });
 });
 
@@ -31,7 +31,7 @@ router.get('/companies', (req, res) => {
 router.post('/login', async (req, res) => {
     try {
         const { username, password } = req.body;
-        const company = req.body.company || req.body.database || 'COMP1';
+        const company = req.body.company || req.body.database || 'Nandan Terry';
         if (!username || !password) {
             return res.status(400).json({ message: 'Username and password are required.' });
         }
