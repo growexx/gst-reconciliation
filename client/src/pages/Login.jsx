@@ -20,8 +20,8 @@ export default function Login() {
                 setCompanies(data.companies || []);
                 if (data.companies?.length > 0) setCompany(data.companies[0]);
             } catch {
-                setCompanies(['COMP1']);
-                setCompany('COMP1');
+                setCompanies(['Nandan Terry']);
+                setCompany('Nandan Terry');
             } finally {
                 setLoadingCompanies(false);
             }

@@ -2,9 +2,12 @@ const reconcileService = require('./reconcileService');
 const { logReconciliation } = require('./logUtils');
 const progressStore = require('./progressStore');
 
+// A GSTIN is 15 chars: 2-digit state code + 10-char PAN + 1 entity char + 'Z' + 1 checksum.
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+
 // Company id: from the X-Company header, else from the JWT, else a default.
 function companyOf(req) {
-    return req.headers['x-company'] || req.headers['x-database'] || req.user?.companyId || 'COMP1';
+    return req.headers['x-company'] || req.headers['x-database'] || req.user?.companyId || 'Nandan Terry';
 }
 function sessionOf(req) {
     return req.headers.authorization?.split(' ')[1];
@@ -94,13 +97,41 @@ class ReconcileController {
         }
     }
 
+    async fetchTaxMismatchBills(req, res) {
+        try {
+            const month = req.query.month || 'Apr';
+            const year = req.query.year || '2026';
+            const data = await reconcileService.getTaxMismatchBills(companyOf(req), month, year);
+            res.json(data);
+        } catch (error) {
+            console.error('Error fetching tax-mismatch bills:', error.message);
+            res.status(500).json({ error: 'Failed to fetch tax-mismatch bills' });
+        }
+    }
+
+    async fetchManualMatchedBills(req, res) {
+        try {
+            const data = await reconcileService.getManuallyMatchedBills(companyOf(req));
+            res.json(data);
+        } catch (error) {
+            console.error('Error fetching manually-matched bills:', error.message);
+            res.status(500).json({ error: 'Failed to fetch manually-matched bills' });
+        }
+    }
+
     async updateBillStatus(req, res) {
         try {
             const companyId = companyOf(req);
             const {
                 docEntry, vendorCode, vendorName, vendorGST, billNumber, billDate,
-                totalAmount, CGST, SGST, IGST, username, excelGST, excelBill,
+                totalAmount, CGST, SGST, IGST, username, excelBill,
             } = req.body;
+
+            // Reconciling requires a proper GSTIN — reject anything that isn't one.
+            const excelGST = String(req.body.excelGST || '').trim().toUpperCase();
+            if (!GSTIN_RE.test(excelGST)) {
+                return res.status(400).json({ message: 'A valid 15-character GSTIN is required to reconcile.' });
+            }
 
             await reconcileService.markReconciled(companyId, docEntry, excelGST, excelBill);
             await logReconciliation({

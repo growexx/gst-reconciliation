@@ -19,14 +19,35 @@
 const AMOUNT_TOLERANCE = 5;     // rupees, on total tax
 const DATE_WINDOW_DAYS = 10;    // ± days
 
-/** Standardize an invoice number the same way the old SQL did. */
+/** Standardize an invoice number: drop separators and leading zeros within EACH
+ *  segment, so "AC/26-27/6" == "AC/26-27/006" and "INV/01" == "INV/1". */
 function normalizeInvoiceNum(value) {
     if (value === null || value === undefined) return '';
     return String(value)
         .toUpperCase()
         .trim()
-        .replace(/[\/\-\s]/g, '')   // strip slashes, dashes, spaces
-        .replace(/^0+/, '');        // strip leading zeros
+        .split(/[^A-Z0-9]+/)                          // split on /, -, space, ., (, ) …
+        .map((seg) => seg.replace(/^0+(?=[0-9])/, '')) // strip a segment's leading zeros (keep ≥1 digit)
+        .join('');
+}
+
+// Tolerant vendor-name comparison — treats the SAME vendor written differently as a
+// match: corporate suffixes (PVT/LTD/LIMITED), 'M/s'/'Ms.' prefixes, '&'/'(India)',
+// and acronym spacing ("R S W M" == "RSWM"). Genuinely different names still conflict.
+const NAME_GENERIC = ['PRIVATELIMITED', 'PRIVATE', 'LIMITED', 'PVTLTD', 'PVT', 'LTD', 'LLP',
+    'INDIA', 'ENTERPRISES', 'ENTERPRISE', 'INDUSTRIES', 'INDUSTRY', 'TRADERS', 'TRADING', 'COMPANY', 'CORPORATION'];
+const nameCore = (s) => {
+    let x = String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');   // drop spaces/punct → handles "R S W M", "M/s", "&", "()"
+    for (const g of NAME_GENERIC) x = x.split(g).join('');             // strip generic suffix/words
+    return x;
+};
+const nameSigTokens = (s) => String(s || '').toUpperCase().split(/[^A-Z0-9]+/).filter((t) => t.length >= 4 && !NAME_GENERIC.includes(t));
+function vendorNamesAgree(a, b) {
+    if (!a || !b) return true;                                  // nothing to compare → don't block
+    const ca = nameCore(a); const cb = nameCore(b);
+    if (ca && cb && (ca === cb || ca.includes(cb) || cb.includes(ca))) return true;
+    const ta = new Set(nameSigTokens(a)); const tb = nameSigTokens(b);
+    return tb.some((t) => ta.has(t));                           // share a significant brand word
 }
 
 function toDate(v) {
@@ -82,141 +103,156 @@ function isMatch(line, inv) {
     return approx(invoiceTax(inv), lineTax(line));
 }
 
-/** Classify a T2 (invoice-no) match: clean, or flagged for amount/date drift. */
-function classifyT2(taxDelta, dateDelta) {
-    const flags = [];
-    if (Math.abs(taxDelta) > AMOUNT_TOLERANCE) flags.push('amount_mismatch');
-    if (dateDelta > DATE_WINDOW_DAYS) flags.push('date_mismatch');
-    if (!flags.length) return { status: 'Match', reason: 'invno (tax & date within tolerance)' };
-    return { status: 'Match-Review', reason: flags.join(' + ') };
-}
+// ── Result categories (stored verbatim on the line and used by the service) ──
+//   GSTIN "ok" means the SAP GSTIN equals the 2B GSTIN, OR the SAP bill has no
+//   GSTIN at all (it then adopts the 2B GSTIN). Bills are paired on bill number.
+const CATEGORY = {
+    MATCH:       'Match',               // GSTIN ok (or adopted + vendor verified) + bill + value + date -> reconciled
+    DATE_DIFF:   'Match-DateDiff',      // as Match but date out of tolerance                            -> reconciled
+    GST_DIFF:    'NotMatch-GstDiff',    // bill + value (+date) agree, native GSTIN differs              -> NOT reconciled
+    VALUE_DIFF:  'NotMatch-ValueDiff',  // GSTIN + bill agree, tax value off > ±5                        -> NOT reconciled
+    VENDOR_DIFF: 'NotMatch-VendorDiff', // bill + value match, GSTIN adopted from 2B but SAP's own vendor differs -> NOT reconciled
+    NO_BILL:     'NotMatch-NoBillNo',   // GSTIN + value + date agree, bill-no does NOT                  -> NOT reconciled (manual)
+};
+const REASONS = {
+    'Match':              'exact (GSTIN + bill-no + value + date)',
+    'Match-DateDiff':     'GSTIN + bill-no + value match; invoice date differs',
+    'NotMatch-GstDiff':   'bill-no + value + date match but GSTIN differs',
+    'NotMatch-ValueDiff': 'GSTIN + bill-no match but tax value differs > tolerance',
+    'NotMatch-VendorDiff':'bill-no + value match, but SAP’s vendor for this bill differs from the 2B supplier',
+    'NotMatch-NoBillNo':  'GSTIN + value + date match but bill number differs — reconcile manually',
+};
+// Categories that count as an actual (reconciled) match. The rest are "near
+// misses" surfaced in their own Not-Matched buckets, NOT reconciled.
+const MATCHED_CATEGORIES = new Set([CATEGORY.MATCH, CATEGORY.DATE_DIFF]);
 
 /**
- * Run reconciliation for one upload.
- * @param {Array} lines     portal 2B lines for this period (each needs an _id)
- * @param {Array} invoices  candidate AP invoices (same company)
- * @returns {{ matches: Array, matchedInvoiceKeys: Set }}
- *   matches: { lineId, invoiceDocNo, invoiceFiscalYear, tier, reason, status, taxDelta, dateDelta }
+ * Run reconciliation for a set of 2B lines against candidate AP invoices.
+ * @param {Array}  lines     2B lines (each needs _id, supplierGstin, invoiceNum, tax, invoiceDate)
+ * @param {Array}  invoices  candidate AP invoices (same company / window / category)
+ * @param {Object} [opts]    { absTax } — compare |tax| (CDNR credit/debit notes can be signed)
+ * @returns {{ matches: Array }} each: { lineId, invoiceDocNo, invoiceFiscalYear, category,
+ *          status, reason, backfillGstin, taxDelta, dateDelta }
  */
-function reconcile(lines, invoices) {
-    // Index live (non-cancelled) invoices two ways:
-    //  - byGstin: GSTIN-bearing invoices, for the strict GSTIN tiers (T1-T3).
-    //  - byRef:   ALL invoices by normalized invoice no, for the T4 fallback
-    //             (invoice-no + tax). T4 must consider invoices that DO carry a
-    //             GSTIN too — a fallback-assigned GSTIN can differ from the 2B's,
-    //             in which case the GSTIN tiers miss it but invoice-no + tax still
-    //             matches (and the 2B GSTIN is then adopted).
-    const byGstin = new Map();
-    const byRef = new Map();
+function reconcile(lines, invoices, opts = {}) {
+    const absTax = !!opts.absTax;
+    const tx = absTax ? (v) => Math.abs(Number(v) || 0) : (v) => Number(v) || 0;
+
+    const byRef = new Map();    // normalized bill/note no -> [inv]
+    const byGstin = new Map();  // GSTIN -> [inv]
     for (const inv of invoices) {
         if (inv.cancelled) continue;
-        const g = String(inv.vendorGstin || '').toUpperCase();
-        if (g) {
-            if (!byGstin.has(g)) byGstin.set(g, []);
-            byGstin.get(g).push(inv);
-        }
         const r = normInvRef(inv);
-        if (r) {
-            if (!byRef.has(r)) byRef.set(r, []);
-            byRef.get(r).push(inv);
-        }
+        if (r) { if (!byRef.has(r)) byRef.set(r, []); byRef.get(r).push(inv); }
+        const g = String(inv.vendorGstin || '').toUpperCase();
+        if (g) { if (!byGstin.has(g)) byGstin.set(g, []); byGstin.get(g).push(inv); }
     }
 
     const usedLine = new Set();
-    const usedInvoice = new Set();
-    const invKey = (inv) => `${inv.docNo}|${inv.fiscalYear}`;
+    const usedInv = new Set();
+    const invKey = (i) => `${i.docNo}|${i.fiscalYear}`;
     const matches = [];
 
-    function buildMatch(line, inv, tier) {
+    const lineG       = (l) => String(l.supplierGstin || '').toUpperCase();
+    const invG        = (i) => String(i.vendorGstin || '').toUpperCase();
+    const valueOk     = (l, i) => Math.abs(tx(invoiceTax(i)) - tx(lineTax(l))) <= AMOUNT_TOLERANCE;
+    const dateOk      = (l, i) => daysApart(l.invoiceDate, invDate(i)) <= DATE_WINDOW_DAYS;
+    const gstinEq     = (l, i) => !!lineG(l) && lineG(l) === invG(i);
+    const gstinAbsent = (i) => !invG(i);
+    const gstinDiff   = (l, i) => !gstinAbsent(i) && !!lineG(l) && lineG(l) !== invG(i);
+    const billEq      = (l, i) => !!normRef(l) && normRef(l) === normInvRef(i);
+
+    // ── Vendor checks for a GSTIN-less SAP bill that would adopt the 2B GSTIN ──
+    // SAP's OWN identity for the bill = its RBKP-reserve vendor (or BSEG name).
+    const hasOwnVendor = (i) => !!(i.rbkpGstin || i.vendorName);
+    const ownVendorAgrees = (l, i) => {
+        if (i.rbkpGstin && String(i.rbkpGstin).toUpperCase() === lineG(l)) return true; // reserve confirms same GSTIN
+        return vendorNamesAgree(i.rbkpVendorName || i.vendorName, l.supplierName);
+    };
+    // Look the 2B GSTIN up in SAP's vendor master; does its registered name match the 2B?
+    const vendorByGstin = opts.vendorByGstin || null;
+    const masterAgrees = (l, i) => {
+        if (!vendorByGstin) return true;
+        const names = vendorByGstin.get(lineG(l));     // a GSTIN can map to several SAP vendor codes
+        if (!names || !names.length) return true;      // 2B GSTIN not in SAP master → can't disprove
+        return names.some((nm) => vendorNamesAgree(nm, l.supplierName));   // ANY SAP vendor for it agrees
+    };
+    // A GSTIN-less bill matches only if SAP's vendor for it agrees with the 2B:
+    //  - if SAP has its own vendor for the bill → that must agree (else it's a different
+    //    vendor's invoice; the bill simply isn't this 2B line → stays unmatched);
+    //  - else fall back to the vendor-master name for the 2B GSTIN.
+    const vendorVerified = (l, i) => hasOwnVendor(i) ? ownVendorAgrees(l, i) : masterAgrees(l, i);
+    const vendorOk    = (l, i) => gstinEq(l, i) || (gstinAbsent(i) && vendorVerified(l, i));
+
+    function buildMatch(line, inv, category) {
         const taxDelta = +(invoiceTax(inv) - lineTax(line)).toFixed(2);
-        const dateDelta = daysApart(line.invoiceDate, invDate(inv));
-        let status = 'Match', reason, backfillGstin;
-        if (tier === 'T1') reason = 'exact (GSTIN+inv+tax+date)';
-        else if (tier === 'T3') reason = 'tax+date (auto/no reference)';
-        else if (tier === 'T4') {
-            reason = 'invoice-no + tax (GSTIN taken from 2B)';
-            backfillGstin = String(line.supplierGstin || '').toUpperCase();   // no SAP vendor -> adopt the 2B GSTIN
-        } else ({ status, reason } = classifyT2(taxDelta, dateDelta));
+        const dd = daysApart(line.invoiceDate, invDate(inv));
         return {
             lineId: line._id,
             invoiceDocNo: inv.docNo,
             invoiceFiscalYear: inv.fiscalYear,
-            tier, status, reason, backfillGstin,
+            category, status: category, reason: REASONS[category] || category,
+            // adopt the 2B GSTIN only when SAP has none AND this is a real match
+            backfillGstin: (MATCHED_CATEGORIES.has(category) && gstinAbsent(inv)) ? lineG(line) : undefined,
             taxDelta,
-            dateDelta: isFinite(dateDelta) ? Math.round(dateDelta) : null,
+            dateDelta: isFinite(dd) ? Math.round(dd) : null,
         };
     }
 
-    // One tier pass: assign each still-free line to its best still-free invoice.
-    function pass(predicate, tier) {
+    // One pass: assign each still-free line to its best still-free invoice that
+    // satisfies `pred`. `index` chooses the candidate pool (by bill-no or GSTIN).
+    function pass(pred, category, index) {
         for (const line of lines) {
             if (usedLine.has(line._id)) continue;
-            const g = String(line.supplierGstin || '').toUpperCase();
-            if (!g) continue;
-            const cands = byGstin.get(g) || [];
+            const key = index === 'gstin' ? lineG(line) : normRef(line);
+            if (!key) continue;
+            const cands = (index === 'gstin' ? byGstin : byRef).get(key) || [];
             let best = null, bestScore = Infinity;
             for (const inv of cands) {
-                if (usedInvoice.has(invKey(inv))) continue;
-                if (!predicate(line, inv)) continue;
+                if (usedInv.has(invKey(inv))) continue;
+                if (!pred(line, inv)) continue;
                 const dd = daysApart(line.invoiceDate, invDate(inv));
-                // The date term must not poison the score when a date is missing:
-                // T2 matches on invoice-no alone, so a null/invalid date must still
-                // produce a finite score (else `score < Infinity` is never true and
-                // a valid invoice-no match is silently dropped).
-                const score = Math.abs(invoiceTax(inv) - lineTax(line))
+                const score = Math.abs(tx(invoiceTax(inv)) - tx(lineTax(line)))
                     + (isFinite(dd) ? dd : DATE_WINDOW_DAYS * 100);
-                // Deterministic tie-break: on an exact score tie prefer the lower
-                // invoice key, so the result is independent of DB/return order.
+                // Deterministic tie-break so the result is independent of DB order.
                 if (score < bestScore || (score === bestScore && best && invKey(inv) < invKey(best))) {
                     bestScore = score; best = inv;
                 }
             }
             if (best) {
                 usedLine.add(line._id);
-                usedInvoice.add(invKey(best));
-                matches.push(buildMatch(line, best, tier));
+                usedInv.add(invKey(best));
+                matches.push(buildMatch(line, best, category));
             }
         }
     }
 
-    const refEq = (l, i) => normRef(l) && normRef(l) === normInvRef(i);
-    const amtDateOk = (l, i) => approx(invoiceTax(i), lineTax(l))
-        && daysApart(l.invoiceDate, invDate(i)) <= DATE_WINDOW_DAYS;
+    // Real matches always run.
+    pass((l, i) => billEq(l, i) && valueOk(l, i) && vendorOk(l, i) && dateOk(l, i),  CATEGORY.MATCH,      'ref');
+    pass((l, i) => billEq(l, i) && valueOk(l, i) && vendorOk(l, i) && !dateOk(l, i), CATEGORY.DATE_DIFF,  'ref');
 
-    pass((l, i) => refEq(l, i) && amtDateOk(l, i), 'T1');   // exact
-    pass((l, i) => refEq(l, i), 'T2');                       // invoice-no only
-    pass((l, i) => amtDateOk(l, i), 'T3');                   // amount+date, no ref
-
-    // T4: fallback — any still-unmatched invoice matched on invoice-no + total
-    // tax (±tolerance), regardless of whether it carries a (possibly wrong)
-    // GSTIN. The GSTIN is then adopted from the 2B line.
-    for (const line of lines) {
-        if (usedLine.has(line._id)) continue;
-        const r = normRef(line);
-        if (!r) continue;
-        const cands = byRef.get(r) || [];
-        let best = null, bestScore = Infinity;
-        for (const inv of cands) {
-            if (usedInvoice.has(invKey(inv))) continue;
-            if (!approx(invoiceTax(inv), lineTax(line))) continue;   // tax must agree (±tol)
-            const score = Math.abs(invoiceTax(inv) - lineTax(line));
-            if (score < bestScore || (score === bestScore && best && invKey(inv) < invKey(best))) {
-                bestScore = score; best = inv;
-            }
-        }
-        if (best) {
-            usedLine.add(line._id);
-            usedInvoice.add(invKey(best));
-            matches.push(buildMatch(line, best, 'T4'));
-        }
+    // GST-Diff (native GSTIN present but differs). Skipped in the RBKP-fallback pass
+    // (opts.skipGstDiff): there the candidate GSTIN is the RBKP-reserve GSTIN, so a
+    // mismatch just means SAP's reserve vendor differs (a collision) — that 2B line must
+    // fall through to "In 2B, not in SAP", not become a GST-Diff near-miss.
+    if (!opts.skipGstDiff) {
+        pass((l, i) => billEq(l, i) && valueOk(l, i) && gstinDiff(l, i),             CATEGORY.GST_DIFF,   'ref');
     }
+    // Diff-Vendor-Name (clause 2): GSTIN-less bill with NO own SAP vendor, where the 2B
+    // GSTIN looked up in SAP's vendor master resolves to a DIFFERENT supplier name.
+    pass((l, i) => billEq(l, i) && valueOk(l, i) && gstinAbsent(i) && !hasOwnVendor(i) && !masterAgrees(l, i), CATEGORY.VENDOR_DIFF, 'ref');
+    // Value-Diff requires the SAME GSTIN — else a shared bill number across two
+    // different vendors would falsely pair. (Safe in the fallback pass: gstinEq guards it.)
+    pass((l, i) => billEq(l, i) && gstinEq(l, i) && !valueOk(l, i),                  CATEGORY.VALUE_DIFF, 'ref');
+    // No bill-no match anywhere, but GSTIN + value + date agree → manual bucket.
+    pass((l, i) => gstinEq(l, i) && valueOk(l, i) && dateOk(l, i),                   CATEGORY.NO_BILL,    'gstin');
 
-    const matchedInvoiceKeys = new Set(matches.map((m) => `${m.invoiceDocNo}|${m.invoiceFiscalYear}`));
-    return { matches, matchedInvoiceKeys };
+    return { matches };
 }
 
 module.exports = {
     normalizeInvoiceNum, isMatch, reconcile,
     invoiceTax, lineTax,
+    CATEGORY, REASONS, MATCHED_CATEGORIES,
     AMOUNT_TOLERANCE, DATE_WINDOW_DAYS,
 };

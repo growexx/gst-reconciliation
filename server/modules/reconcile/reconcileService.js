@@ -9,7 +9,7 @@
 const xlsx = require('xlsx');
 const { ObjectId } = require('mongodb');
 const { collections } = require('../../config/db');
-const { normalizeInvoiceNum, reconcile } = require('./matcher');
+const { normalizeInvoiceNum, reconcile, MATCHED_CATEGORIES } = require('./matcher');
 
 // ── Fallback header mapping for an already-flat portal sheet ───────────────
 const HEADER_ALIASES = {
@@ -60,6 +60,20 @@ function financialYearStart(month, year) {
     const m = MONTHS[month] || Number(month) || 1;
     const startYear = m >= 4 ? Number(year) : Number(year) - 1;
     return new Date(Date.UTC(startYear, 3, 1)); // April 1
+}
+
+/**
+ * Reconciliation window = the current financial year (of month/year) PLUS the
+ * previous one — two Indian FYs (Apr–Mar). Both SAP invoices (by Doc Date) and
+ * 2B lines (by invoice date) within [start, end) are eligible to be re-matched.
+ */
+function fyWindow(month, year) {
+    const fyStart = financialYearStart(month, year);
+    const y = fyStart.getUTCFullYear();
+    return {
+        start: new Date(Date.UTC(y - 1, 3, 1)),   // previous FY, 1 April
+        end:   new Date(Date.UTC(y + 1, 3, 1)),    // next FY, 1 April (exclusive)
+    };
 }
 
 const GSTIN_RE = /^[0-9]{2}[A-Z0-9]{13}$/i;
@@ -117,6 +131,56 @@ function parseGstr2bB2B(fileBuffer) {
             integratedTax: num(r[C.igst]),
             cess: num(r[C.cess]),
             itcAvailable: r[C.itc] != null ? String(r[C.itc]).trim() : '',
+        });
+    }
+    return out;
+}
+
+/**
+ * Parse the GSTR-2B "B2B-CDNR" sheet (credit/debit notes received). Same multi-row
+ * header layout as B2B; the note number plays the role of the invoice number for
+ * matching, and the note type (Credit Note / Debit Note) is preserved.
+ * @returns {Array} raw CDNR line objects (pre-DB-shape); [] if the sheet is absent.
+ */
+function parseGstr2bCDNR(fileBuffer) {
+    const wb = xlsx.read(fileBuffer, { type: 'buffer', cellDates: true });
+    const sheetName = wb.SheetNames.find((n) => String(n).trim().toUpperCase() === 'B2B-CDNR');
+    if (!sheetName) return [];                          // file has no CDNR sheet
+    const rows = xlsx.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: null, blankrows: false });
+    if (!rows.length) return [];
+
+    // Data starts at the first row whose col 0 is a GSTIN (after the 2-row header block).
+    let dataStart = -1;
+    for (let i = 0; i < rows.length; i++) {
+        if (GSTIN_RE.test(String((rows[i] || [])[0] || '').trim())) { dataStart = i; break; }
+    }
+    if (dataStart === -1) return [];
+
+    // Standard GSTR-2B B2B-CDNR column order.
+    const C = {
+        gstin: 0, name: 1, noteno: 2, notetype: 3, supplytype: 4, notedate: 5, noteval: 6,
+        pos: 7, rcm: 8, taxable: 9, igst: 10, cgst: 11, sgst: 12, cess: 13,
+    };
+    const out = [];
+    for (let i = dataStart; i < rows.length; i++) {
+        const r = rows[i] || [];
+        const gstin = String(r[C.gstin] || '').trim().toUpperCase();
+        if (!GSTIN_RE.test(gstin)) continue;            // skip stray / total rows
+        const noteType = r[C.notetype] != null ? String(r[C.notetype]).trim() : '';
+        out.push({
+            supplierGstin: gstin,
+            supplierName: r[C.name] != null ? String(r[C.name]).trim() : '',
+            invoiceNum: r[C.noteno] != null ? String(r[C.noteno]).trim() : '',   // note no == match key
+            invoiceType: noteType,
+            noteType,                                    // 'Credit Note' | 'Debit Note'
+            pos: r[C.pos] != null ? String(r[C.pos]).trim() : '',
+            invoiceDate: parseDate(r[C.notedate]),
+            invoiceValue: num(r[C.noteval]),
+            centralTax: num(r[C.cgst]),
+            stateTax: num(r[C.sgst]),
+            integratedTax: num(r[C.igst]),
+            cess: num(r[C.cess]),
+            itcAvailable: '',
         });
     }
     return out;
@@ -300,112 +364,151 @@ class ReconcileService {
         }
         const periodId = period._id;
 
-        // 2. Parse the GSTR-2B workbook (handles the real multi-row header).
-        const parsed = parseGstr2bB2B(fileBuffer);
-        if (!parsed.length) throw new Error('No B2B invoices found in the GSTR-2B file.');
+        // 2. Parse both the B2B sheet (vendor invoices) and the B2B-CDNR sheet
+        //    (credit/debit notes). CDNR is optional — older files may not carry it.
+        const b2b = parseGstr2bB2B(fileBuffer);
+        const cdnr = parseGstr2bCDNR(fileBuffer);
+        if (!b2b.length && !cdnr.length) throw new Error('No B2B or CDNR rows found in the GSTR-2B file.');
 
-        // 3. Build + insert line docs.
-        const lineDocs = [];
-        for (let i = 0; i < parsed.length; i++) {
-            const p = parsed[i];
-            lineDocs.push({
-                periodId, companyId,
-                supplierGstin: p.supplierGstin,
-                supplierName: p.supplierName,
-                invoiceNum: p.invoiceNum,
-                normalizedInvoiceNum: normalizeInvoiceNum(p.invoiceNum),
-                invoiceType: p.invoiceType,
-                pos: p.pos,
-                invoiceDate: p.invoiceDate,
-                invoiceValue: p.invoiceValue,
-                centralTax: p.centralTax,
-                stateTax: p.stateTax,
-                integratedTax: p.integratedTax,
-                cess: p.cess,
-                tax: +(p.centralTax + p.stateTax + p.integratedTax + p.cess).toFixed(2),
-                itcAvailable: p.itcAvailable,
-                matchStatus: 'NEW',
-                matchedDocNo: null,
-            });
-            if (onProgress) onProgress(i + 1, parsed.length);
-        }
-        const inserted = await collections.lines().insertMany(lineDocs);
-        const lines = lineDocs.map((d, i) => ({ ...d, _id: inserted.insertedIds[i] }));
+        // 3. Build + insert this period's line docs, tagged by section.
+        const mkLine = (p, section) => ({
+            periodId, companyId, section,
+            supplierGstin: p.supplierGstin,
+            supplierName: p.supplierName,
+            invoiceNum: p.invoiceNum,
+            normalizedInvoiceNum: normalizeInvoiceNum(p.invoiceNum),
+            invoiceType: p.invoiceType,
+            noteType: p.noteType || null,
+            pos: p.pos,
+            invoiceDate: p.invoiceDate,
+            invoiceValue: p.invoiceValue,
+            centralTax: p.centralTax,
+            stateTax: p.stateTax,
+            integratedTax: p.integratedTax,
+            cess: p.cess,
+            tax: +(p.centralTax + p.stateTax + p.integratedTax + p.cess).toFixed(2),
+            itcAvailable: p.itcAvailable,
+            matchStatus: 'NEW',
+            matchedDocNo: null,
+        });
+        const lineDocs = [
+            ...b2b.map((p) => mkLine(p, 'B2B')),
+            ...cdnr.map((p) => mkLine(p, 'CDNR')),
+        ];
+        if (onProgress) onProgress(lineDocs.length, lineDocs.length);
+        await collections.lines().insertMany(lineDocs);
 
-        // 4. Deterministic reset — restore the clean ETL state so re-running the
-        //    same 2B always yields the same result (prior auto-backfilled GSTINs
-        //    must not drift the matcher). Manual reconciliations are preserved.
+        // 4. Rolling window = current + previous FY. Re-match EVERY 2B line in the
+        //    window (all prior periods too, not just this upload) against every SAP
+        //    candidate in the window, so earlier unmatched bills get another chance.
+        const win = fyWindow(month, year);
+        const inWin = { $gte: win.start, $lt: win.end };
+
+        // 4a. Deterministic reset of in-window state (idempotent re-run). Auto
+        //     reconciliations + adopted GSTINs are cleared; manual matches are kept
+        //     (reconciledAuto != true) and re-applied at the end.
         await collections.apInvoices().updateMany(
-            { companyId, reconciledAuto: true },
+            { companyId, reconciledAuto: true, docDate: inWin },
             { $set: { reconciled: false },
-              $unset: { reconciledAuto: '', reconciledAt: '', reconciledPeriodId: '', reconciledTier: '', reconciledReason: '', reconciledFlag: '', reconciledTaxDelta: '', reconciledStage: '' } });
+              $unset: { reconciledAuto: '', reconciledAt: '', reconciledPeriodId: '', reconciledCategory: '', reconciledReason: '', reconciledStage: '', reconciledTaxDelta: '', reconciledFlag: '', reconciledTier: '' } });
+        await collections.apInvoices().updateMany(
+            { companyId, docDate: inWin, pairCategory: { $ne: null } },
+            { $unset: { pairCategory: '', pairedBillNo: '', pairedDate: '' } });
         await collections.apInvoices().updateMany(
             { companyId, gstinSource: { $in: ['2B', 'RBKP-promoted', 'sibling'] } },
             { $set: { vendorGstin: '', vendorCode: '' }, $unset: { gstinSource: '' } });
 
-        // 5. Load candidates (all non-cancelled; deterministic order).
+        // 4b. Load in-window 2B lines (across ALL periods) and reset them to NEW so
+        //     a line left unmatched this run can't keep a stale prior status.
+        const allLines = await collections.lines().find({ companyId, invoiceDate: inWin }).toArray();
+        await collections.lines().updateMany(
+            { companyId, invoiceDate: inWin },
+            { $set: { matchStatus: 'NEW', matchedDocNo: null },
+              $unset: { matchCategory: '', matchReason: '', matchStage: '', taxDelta: '', dateDeltaDays: '' } });
+        const b2bLines = allLines.filter((l) => (l.section || 'B2B') === 'B2B');
+        const cdnrLines = allLines.filter((l) => l.section === 'CDNR');
+
+        // 4c. Load in-window candidates (non-cancelled, reconcilable — SA excluded).
         const candidates = await collections.apInvoices()
-            .find({ companyId, cancelled: { $ne: true } })
+            .find({ companyId, cancelled: { $ne: true }, docCategory: { $ne: 'NONE' }, docDate: inWin })
             .sort({ docNo: 1, fiscalYear: 1 })
             .toArray();
         const candByKey = new Map(candidates.map((c) => [`${c.docNo}|${c.fiscalYear}`, c]));
-        const lineById = new Map(lines.map((l) => [String(l._id), l]));
+        const lineById = new Map(allLines.map((l) => [String(l._id), l]));
 
-        // 6. STAGE 1 — BKPF + BSET + BSEG + ACDOCA + LFA1: match on the SAP GSTIN
-        //    (where BSEG/ACDOCA gave one) then on invoice-no + tax. BKPF only.
-        const bkpfCandidates = candidates.filter((c) => c.source === 'BKPF');
-        const matches = reconcile(lines, bkpfCandidates).matches.map((m) => ({ ...m, stage: 1 }));
+        // 4d. SAP vendor master (LFA1) GSTIN → name, used to verify a GSTIN-less bill's
+        //     adopted 2B GSTIN against the vendor SAP has registered for it.
+        const vmRows = await collections.vendors()
+            .find({ companyId, vendorGstin: { $nin: ['', null] } }, { projection: { vendorGstin: 1, vendorName: 1 } }).toArray();
+        const vendorByGstin = new Map();
+        for (const v of vmRows) { const g = String(v.vendorGstin).toUpperCase(); if (!vendorByGstin.has(g)) vendorByGstin.set(g, []); vendorByGstin.get(g).push(v.vendorName || ''); }
+        const matchOpts = { vendorByGstin };
 
-        // 7. STAGE 2 — RBKP + LFA1 fallback for the 2B lines STILL unreconciled.
-        //    Candidates: RBKP-only invoices (source 'RBKP', carry the LFA1 GSTIN —
-        //    invoices BKPF doesn't have) PLUS BKPF leftovers promoted with their
-        //    reserved RBKP GSTIN. Then re-match the leftover 2B lines.
-        const usedLine = new Set(matches.map((m) => String(m.lineId)));
-        const usedInv = new Set(matches.map((m) => `${m.invoiceDocNo}|${m.invoiceFiscalYear}`));
-        const stage2Lines = lines.filter((l) => !usedLine.has(String(l._id)));
-        const stage2Invs = candidates
-            .filter((i) => !usedInv.has(`${i.docNo}|${i.fiscalYear}`) && (i.source === 'RBKP' || i.rbkpGstin))
+        // 5. B2B reconciliation — STAGE 1 (BKPF on its SAP GSTIN / bill-no + value),
+        //    then STAGE 2 (RBKP-promoted GSTINs) for lines stage 1 left with NO
+        //    record at all (near-misses keep their stage-1 classification).
+        const b2bCands = candidates.filter((c) => c.docCategory === 'B2B');
+        const bkpfCands = b2bCands.filter((c) => c.source === 'BKPF');
+        const matches = reconcile(b2bLines, bkpfCands, matchOpts).matches.map((m) => ({ ...m, stage: 1 }));
+
+        const seenLine1 = new Set(matches.map((m) => String(m.lineId)));
+        const usedInv1 = new Set(matches.map((m) => `${m.invoiceDocNo}|${m.invoiceFiscalYear}`));
+        const stage2Lines = b2bLines.filter((l) => !seenLine1.has(String(l._id)));
+        const stage2Invs = b2bCands
+            .filter((i) => !usedInv1.has(`${i.docNo}|${i.fiscalYear}`) && (i.source === 'RBKP' || i.rbkpGstin))
             .map((i) => i.source === 'RBKP'
                 ? i
                 : { ...i, vendorGstin: i.rbkpGstin, vendorCode: i.rbkpVendorCode || i.vendorCode, vendorName: i.rbkpVendorName || i.vendorName });
         if (stage2Lines.length && stage2Invs.length) {
-            for (const m of reconcile(stage2Lines, stage2Invs).matches) matches.push({ ...m, stage: 2 });
+            // skipGstDiff: in the RBKP fallback the candidate GSTIN is the reserve GSTIN,
+            // so a GSTIN mismatch is a collision (different vendor) — it must fall through
+            // to "In 2B, not in SAP", not become a GST-Diff near-miss.
+            for (const m of reconcile(stage2Lines, stage2Invs, { ...matchOpts, skipGstDiff: true }).matches) matches.push({ ...m, stage: 2 });
         }
 
-        // 8. Persist matches: mark lines + auto-reconcile invoices (adopt the
-        //    matched 2B GSTIN for display; tag the stage + GSTIN source).
+        // 6. KG ↔ CDNR (credit/debit notes). Single stage; compare |tax| since SAP
+        //    credit memos can be signed. KG bills carry docCategory 'CDNR'.
+        const kgCands = candidates.filter((c) => c.docCategory === 'CDNR');
+        if (cdnrLines.length && kgCands.length) {
+            for (const m of reconcile(cdnrLines, kgCands, { absTax: true }).matches) matches.push({ ...m, stage: 1 });
+        }
+
+        // 7. Persist. Matched categories reconcile the invoice; near-misses
+        //    (GST-Diff / Value-Diff) only tag a pairing so they surface in their own
+        //    Not-Matched bucket instead of under "in SAP, not in 2B".
         if (matches.length) {
             await collections.lines().bulkWrite(matches.map((m) => ({
                 updateOne: { filter: { _id: m.lineId }, update: { $set: {
-                    matchStatus: m.status, matchedDocNo: m.invoiceDocNo, matchTier: m.tier,
+                    matchStatus: m.status, matchedDocNo: m.invoiceDocNo, matchCategory: m.category,
                     matchReason: m.reason, matchStage: m.stage, taxDelta: m.taxDelta, dateDeltaDays: m.dateDelta } } },
             })), { ordered: false });
 
             await collections.apInvoices().bulkWrite(matches.map((m) => {
                 const ln = lineById.get(String(m.lineId));
                 const cand = candByKey.get(`${m.invoiceDocNo}|${m.invoiceFiscalYear}`);
+                if (!MATCHED_CATEGORIES.has(m.category)) {              // near miss — record pairing, do NOT reconcile
+                    return { updateOne: { filter: { companyId, docNo: m.invoiceDocNo, fiscalYear: m.invoiceFiscalYear },
+                        update: { $set: { pairCategory: m.category, pairedBillNo: ln ? ln.invoiceNum : null, pairedDate: ln ? ln.invoiceDate : null } } } };
+                }
                 const set = {
                     reconciled: true, reconciledAuto: true, reconciledAt: new Date(), reconciledPeriodId: periodId,
-                    reconciledTier: m.tier, reconciledReason: m.reason, reconciledStage: m.stage,
-                    reconciledFlag: m.status === 'Match-Review' ? m.reason : null, reconciledTaxDelta: m.taxDelta,
+                    reconciledCategory: m.category, reconciledReason: m.reason, reconciledStage: m.stage,
+                    reconciledFlag: m.category === 'Match-DateDiff' ? m.reason : null, reconciledTaxDelta: m.taxDelta,
                 };
-                if (m.stage === 2) {
-                    if (cand && cand.source === 'BKPF') {             // BKPF leftover promoted via its RBKP GSTIN
-                        set.vendorGstin = cand.rbkpGstin || (ln && ln.supplierGstin) || '';
-                        set.vendorCode = cand.rbkpVendorCode || cand.vendorCode || '';
-                        set.vendorName = cand.rbkpVendorName || cand.vendorName || '';
-                        set.gstinSource = 'RBKP-promoted';
-                    }
-                    // source 'RBKP' invoices already carry their LFA1 vendor/GSTIN — leave as-is.
-                } else if (m.backfillGstin) {                         // T4: GSTIN taken from 2B
+                if (m.stage === 2 && cand && cand.source === 'BKPF') {  // BKPF leftover promoted via its RBKP GSTIN
+                    set.vendorGstin = cand.rbkpGstin || (ln && ln.supplierGstin) || '';
+                    set.vendorCode = cand.rbkpVendorCode || cand.vendorCode || '';
+                    set.vendorName = cand.rbkpVendorName || cand.vendorName || '';
+                    set.gstinSource = 'RBKP-promoted';
+                } else if (m.backfillGstin) {                           // GSTIN adopted from the 2B line
                     set.vendorGstin = m.backfillGstin; set.gstinSource = '2B';
                 }
                 return { updateOne: { filter: { companyId, docNo: m.invoiceDocNo, fiscalYear: m.invoiceFiscalYear }, update: { $set: set } } };
             }), { ordered: false });
         }
 
-        // 8b. Sibling propagation — a still-undefined doc (e.g. split posting) adopts
-        //     a resolved sibling's vendor (same invoice no, single GSTIN). Deterministic.
+        // 8. Sibling propagation — a still-undefined B2B doc adopts a resolved
+        //    sibling's vendor (same bill no, single GSTIN). Deterministic.
         const resolved = await collections.apInvoices().find(
             { companyId, vendorGstin: { $nin: ['', null] }, normalizedInvoiceNum: { $nin: ['', null] } },
             { projection: { normalizedInvoiceNum: 1, vendorGstin: 1, vendorCode: 1, vendorName: 1 } },
@@ -417,7 +520,7 @@ class ReconcileService {
             else if (cur !== 'AMBIG' && cur.vendorGstin !== r.vendorGstin) sibByRef.set(r.normalizedInvoiceNum, 'AMBIG');
         }
         const undefinedDocs = await collections.apInvoices().find(
-            { companyId, source: 'BKPF', reconciled: { $ne: true }, $or: [{ vendorGstin: '' }, { vendorGstin: null }] },
+            { companyId, source: 'BKPF', docCategory: 'B2B', reconciled: { $ne: true }, $or: [{ vendorGstin: '' }, { vendorGstin: null }] },
         ).toArray();
         const propOps = [];
         for (const inv of undefinedDocs) {
@@ -427,22 +530,24 @@ class ReconcileService {
         }
         if (propOps.length) await collections.apInvoices().bulkWrite(propOps, { ordered: false });
 
-        // 7. Unmatched bills for the response = the period-scoped "in SAP, not in
-        //    2B" list (BKPF, this month), identical to the Unmatched Bills tab so
-        //    the post-upload view is consistent.
+        // 9. Re-apply durable manual reconciliations (survive ETL reloads).
+        await this.applyManualReconciliations(companyId);
+
+        // 10. Response = the post-upload "in SAP, not in 2B" list for this period.
         const sections = await this.getUnmatchedSections(companyId, month, year);
         const unmatchedBills = sections.inSapNotIn2b;
-
-        const matchedCount = matches.length;
-        const reviewCount = matches.filter((m) => m.status === 'Match-Review').length;
+        const matched = matches.filter((m) => MATCHED_CATEGORIES.has(m.category));
         return {
             result: {
                 success: true,
                 message: 'File processed successfully',
                 periodId: String(periodId),
-                lines: lines.length,
-                matched: matchedCount,
-                flaggedForReview: reviewCount,
+                lines: lineDocs.length,
+                windowLines: allLines.length,
+                matched: matched.length,
+                dateDiff: matched.filter((m) => m.category === 'Match-DateDiff').length,
+                gstDiff: matches.filter((m) => m.category === 'NotMatch-GstDiff').length,
+                valueDiff: matches.filter((m) => m.category === 'NotMatch-ValueDiff').length,
                 unmatchedBills: unmatchedBills.length,
             },
             unmatchedBills,
@@ -455,6 +560,7 @@ class ReconcileService {
             companyId,
             reconciled: { $ne: true },
             cancelled: { $ne: true },
+            docCategory: { $ne: 'NONE' },          // SA docs are stored but never reconciled / shown
             $expr: { $gt: [{ $add: [{ $ifNull: ['$tax', 0] }, { $ifNull: ['$cgst', 0] }, { $ifNull: ['$sgst', 0] }, { $ifNull: ['$igst', 0] }] }, 0] },
         }).sort({ vendorCode: 1, taxDate: 1 }).toArray();
 
@@ -473,71 +579,223 @@ class ReconcileService {
      * Both scoped to the given month/year by document/invoice date (default Apr-2026).
      */
     async getUnmatchedSections(companyId, month = 'Apr', year = '2026') {
-        const m0 = monthIndex0(month);
+        const m0 = monthIndex0(month);                 // null when month = 'All'
         const y = Number(year);
+        const win = fyWindow(m0 == null ? 'Apr' : month, year);   // 2-FY window
+        const inWin = { $gte: win.start, $lt: win.end };
+        const monthOk = (d) => (m0 == null) ? true : inMonth(d, y, m0);
 
-        const invoices = await collections.apInvoices().find({
-            companyId, cancelled: { $ne: true },
-        }).toArray();
-        const lines = await collections.lines().find({ companyId }).toArray();
+        const invoices = await collections.apInvoices()
+            .find({ companyId, cancelled: { $ne: true }, docDate: inWin }).toArray();
+        const lines = await collections.lines().find({ companyId, invoiceDate: inWin }).toArray();
 
-        const portalIdx = buildPortalIndex(lines);   // for SAP-side reasons
-        const sapIdx = buildSapIndex(invoices);       // for 2B-side reasons
+        // SAP vendor-master GSTIN → name, so near-miss rows can show what SAP has registered.
+        const vmRows = await collections.vendors()
+            .find({ companyId, vendorGstin: { $nin: ['', null] } }, { projection: { vendorGstin: 1, vendorName: 1 } }).toArray();
+        const vendorByGstin = new Map();
+        for (const v of vmRows) { const g = String(v.vendorGstin).toUpperCase(); if (!vendorByGstin.has(g)) vendorByGstin.set(g, []); vendorByGstin.get(g).push(v.vendorName || ''); }
+
+        const portalIdx = buildPortalIndex(lines.filter((l) => (l.section || 'B2B') === 'B2B'));
+        const sapIdx = buildSapIndex(invoices.filter((i) => i.docCategory === 'B2B'));
         const hasGst = (i) => (Number(i.tax) || 0) + (Number(i.cgst) || 0) + (Number(i.sgst) || 0) + (Number(i.igst) || 0) > 0;
 
-        // SAP invoices booked in the period, carrying GST, not reconciled.
-        // Restricted to BKPF (the agreed AP source; RBKP is no longer used).
+        // SAP B2B invoices in the period, carrying GST, NOT reconciled and NOT a
+        // near-match (GST/Value-Diff bills show in their own buckets below).
         const inSapNotIn2b = invoices
-            .filter((i) => i.source === 'BKPF' && i.reconciled !== true && hasGst(i) && (m0 == null || inMonth(i.docDate || i.taxDate, y, m0)))
+            .filter((i) => i.source === 'BKPF' && i.docCategory === 'B2B' && i.reconciled !== true && !i.pairCategory && hasGst(i) && monthOk(i.docDate || i.taxDate))
             .map((i) => toBillDTO(i, classifyUnmatched(i, portalIdx)));
 
-        // 2B lines still NEW (unmatched). NOT invoice-date-filtered: every stored
-        // line belongs to the uploaded return (suppliers late-report earlier-dated
-        // invoices in it), so matched + in2bNotInSap ties out to the full 2B count.
+        // SAP KG (debit/credit notes) not matched to 2B CDNR — the Debit-Note section.
+        const debitNotes = invoices
+            .filter((i) => i.source === 'BKPF' && i.docCategory === 'CDNR' && i.reconciled !== true && !i.pairCategory && hasGst(i) && monthOk(i.docDate || i.taxDate))
+            .map((i) => toBillDTO(i, { category: 'debit_note_unmatched', reason: 'KG note not found in the 2B CDNR section' }));
+
+        // 2B B2B lines still NEW (in 2B, not in SAP).
         const in2bNotInSap = lines
-            .filter((l) => l.matchStatus === 'NEW')
+            .filter((l) => (l.section || 'B2B') === 'B2B' && l.matchStatus === 'NEW' && monthOk(l.invoiceDate))
             .map((l) => to2bLineDTO(l, classify2bUnmatched(l, sapIdx)));
+
+        // 2B CDNR lines still NEW (note in 2B, no SAP KG).
+        const cdnr2bNotInSap = lines
+            .filter((l) => l.section === 'CDNR' && l.matchStatus === 'NEW' && monthOk(l.invoiceDate))
+            .map((l) => to2bLineDTO(l, { category: 'cdnr_not_in_sap', reason: 'CDNR note not booked as a KG in SAP' }));
+
+        // Near-miss buckets — joined 2B↔SAP rows (NOT reconciled). Diff-Bill-No pairs on
+        // GSTIN+value+date with a different bill number, so it carries both bill numbers.
+        const nm = { win, m0, y, excludeReconciled: true, vendorByGstin };
+        const gstDiff = await this._matchedRows(companyId, ['NotMatch-GstDiff'], nm);
+        const valueDiff = await this._matchedRows(companyId, ['NotMatch-ValueDiff'], nm);
+        const vendorDiff = await this._matchedRows(companyId, ['NotMatch-VendorDiff'], nm);
+        const noBillNo = await this._matchedRows(companyId, ['NotMatch-NoBillNo'], nm);
 
         return {
             period: { month, year: String(year) },
-            inSapNotIn2b,
-            in2bNotInSap,
-            counts: { inSapNotIn2b: inSapNotIn2b.length, in2bNotInSap: in2bNotInSap.length },
+            inSapNotIn2b, in2bNotInSap, gstDiff, valueDiff, vendorDiff, noBillNo, debitNotes, cdnr2bNotInSap,
+            counts: {
+                inSapNotIn2b: inSapNotIn2b.length, in2bNotInSap: in2bNotInSap.length,
+                gstDiff: gstDiff.length, valueDiff: valueDiff.length, vendorDiff: vendorDiff.length,
+                noBillNo: noBillNo.length, debitNotes: debitNotes.length, cdnr2bNotInSap: cdnr2bNotInSap.length,
+            },
         };
     }
 
     /**
-     * GET /matched-bills — reconciled pairs for the period, Excel (2B) vs SAP tax
-     * side by side. One row per matched 2B line joined to its SAP invoice.
+     * Shared: 2B lines with the given match statuses, joined to their paired SAP
+     * invoice (whether reconciled or a near-miss), Excel vs SAP tax. Optionally
+     * scoped to a window/month.
      */
-    async getMatchedBills(companyId, month = 'Apr', year = '2026') {
-        // All matched 2B lines belong to the uploaded return — not invoice-date
-        // filtered, so this count + in2bNotInSap equals the full 2B line count.
-        const lines = await collections.lines()
-            .find({ companyId, matchStatus: { $in: ['Match', 'Match-Review'] } })
-            .toArray();
-        const invoices = await collections.apInvoices().find({ companyId, reconciled: true }).toArray();
-        const byDoc = new Map();
-        for (const inv of invoices) byDoc.set(String(inv.docNo), inv);
+    async _matchedRows(companyId, statuses, opts = {}) {
+        const q = { companyId, matchStatus: { $in: statuses } };
+        if (opts.win) q.invoiceDate = { $gte: opts.win.start, $lt: opts.win.end };
+        const all = await collections.lines().find(q).toArray();
 
-        const rows = lines
+        const docNos = [...new Set(all.map((l) => String(l.matchedDocNo)).filter(Boolean))];
+        const invs = docNos.length
+            ? await collections.apInvoices().find({ companyId, docNo: { $in: docNos } }).toArray() : [];
+        const byDoc = new Map();
+        for (const inv of invs) byDoc.set(String(inv.docNo), inv);
+
+        // Month filter: keep a pair if EITHER its 2B date OR its SAP date is in the month.
+        // For near-miss buckets, drop any pair whose SAP bill has since been reconciled
+        // (e.g. a manual reconcile from the table) so it leaves the bucket.
+        const lines = all.filter((l) => {
+            const inv = byDoc.get(String(l.matchedDocNo)) || {};
+            if (opts.excludeReconciled && inv.reconciled === true) return false;
+            if (opts.m0 == null) return true;
+            return inMonth(l.invoiceDate, opts.y, opts.m0) || inMonth(inv.docDate || inv.taxDate, opts.y, opts.m0);
+        });
+
+        const rows = lines.map((l) => {
+            const inv = byDoc.get(String(l.matchedDocNo)) || {};
+            // Prefer the stored total `tax` (RBKP carries tax there, with no split),
+            // else sum the CGST/SGST/IGST components — mirrors the matcher's totals.
+            const excelTax = +(Number(l.tax) || ((Number(l.stateTax) || 0) + (Number(l.centralTax) || 0) + (Number(l.integratedTax) || 0) + (Number(l.cess) || 0))).toFixed(2);
+            const sapTax = +(Number(inv.tax) || ((Number(inv.sgst) || 0) + (Number(inv.cgst) || 0) + (Number(inv.igst) || 0))).toFixed(2);
+            return {
+                VendorGST: l.supplierGstin || inv.vendorGstin || '',
+                SapGST: inv.vendorGstin || inv.rbkpGstin || '',   // effective GSTIN (RBKP reserve fills a blank vendorGstin)
+                Vendor2BName: l.supplierName || '',
+                SapVendorName: inv.vendorName || inv.rbkpVendorName
+                    || (opts.vendorByGstin ? ((opts.vendorByGstin.get(String(l.supplierGstin || '').toUpperCase()) || []).join(' / ')) : ''),
+                VendorBillNo: l.invoiceNum || inv.vendorRef || '',
+                SapBillNo: inv.vendorRef || '',
+                Section: l.section || 'B2B',
+                ExcelSGST: +(Number(l.stateTax) || 0).toFixed(2),
+                ExcelCGST: +(Number(l.centralTax) || 0).toFixed(2),
+                ExcelIGST: +(Number(l.integratedTax) || 0).toFixed(2),
+                SAP_SGST: +(Number(inv.sgst) || 0).toFixed(2),
+                SAP_CGST: +(Number(inv.cgst) || 0).toFixed(2),
+                SAP_IGST: +(Number(inv.igst) || 0).toFixed(2),
+                ExcelTax: excelTax, SAP_Tax: sapTax,
+                TaxDelta: l.taxDelta != null ? l.taxDelta : +(sapTax - excelTax).toFixed(2),
+                DateDeltaDays: l.dateDeltaDays != null ? l.dateDeltaDays : null,
+                InvoiceDate: l.invoiceDate || null,
+                SapDate: inv.docDate || inv.taxDate || null,
+                Category: l.matchCategory || l.matchStatus,
+                Status: l.matchStatus,
+                // fields the manual-reconcile action needs (identify + log the SAP bill)
+                DocEntry: inv.docNo ? `${inv.docNo}|${inv.fiscalYear}` : null,
+                CardCode: inv.vendorCode || '',
+                CardName: inv.vendorName || '',
+                DocTotal: inv.grossAmount != null ? inv.grossAmount : null,
+                Reconciled: inv.reconciled === true,
+            };
+        });
+        rows.sort((a, b) => String(a.VendorGST).localeCompare(String(b.VendorGST)) || String(a.VendorBillNo).localeCompare(String(b.VendorBillNo)));
+        return rows;
+    }
+
+    /** GET /matched-bills — reconciled matches: clean (`match`) + date-diff (`dateDiff`). */
+    async getMatchedBills(companyId, month = 'Apr', year = '2026') {
+        const m0 = monthIndex0(month); const y = Number(year);
+        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const match = await this._matchedRows(companyId, ['Match'], { win, m0, y });
+        const dateDiff = await this._matchedRows(companyId, ['Match-DateDiff'], { win, m0, y });
+        return { period: { month, year: String(year) }, match, dateDiff, matched: match, count: match.length + dateDiff.length };
+    }
+
+    /** GET /tax-mismatch-bills — kept for back-compat; now returns the date-diff matches. */
+    async getTaxMismatchBills(companyId, month = 'Apr', year = '2026') {
+        const m0 = monthIndex0(month); const y = Number(year);
+        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const rows = await this._matchedRows(companyId, ['Match-DateDiff'], { win, m0, y });
+        return { period: { month, year: String(year) }, matched: rows, count: rows.length };
+    }
+
+    /**
+     * Read the manual-reconcile audit trail (recon_log), one entry per document
+     * (latest action wins). This is the DURABLE source — it survives the ETL
+     * reloads that rebuild ap_invoices and wipe the on-invoice reconcile flags.
+     */
+    async _manualReconLog(companyId) {
+        const logs = await collections.reconLog()
+            .find({ companyId, action: 'BILL_RECONCILED' }).sort({ ts: 1 }).toArray();
+        const byDoc = new Map();          // docEntry ('docNo|fiscalYear') -> latest log entry
+        for (const l of logs) byDoc.set(String(l.docNo), l);
+        return [...byDoc.values()];
+    }
+
+    /**
+     * GET /manual-matched-bills — bills reconciled by hand, sourced from recon_log
+     * (durable). The live SAP split is enriched from ap_invoices when the doc still
+     * exists; a bill that has since been AUTO-matched is dropped here (it shows under
+     * Matched instead) so it isn't double-counted.
+     */
+    async getManuallyMatchedBills(companyId) {
+        const entries = await this._manualReconLog(companyId);
+        if (!entries.length) return { manual: [], count: 0 };
+
+        const docNos = entries.map((l) => String(l.docNo).split('|')[0]);
+        const invs = await collections.apInvoices()
+            .find({ companyId, docNo: { $in: docNos } }).toArray();
+        const invByKey = new Map(invs.map((i) => [`${i.docNo}|${i.fiscalYear}`, i]));
+
+        const rows = entries
+            .filter((l) => {
+                const inv = invByKey.get(String(l.docNo));
+                return !(inv && inv.reconciledAuto === true);   // now auto-matched → belongs to Matched
+            })
             .map((l) => {
-                const inv = byDoc.get(String(l.matchedDocNo)) || {};
+                const inv = invByKey.get(String(l.docNo));
                 return {
-                    VendorGST: l.supplierGstin || inv.vendorGstin || '',
-                    VendorBillNo: l.invoiceNum || inv.vendorRef || '',
-                    ExcelSGST: +(Number(l.stateTax) || 0).toFixed(2),
-                    ExcelCGST: +(Number(l.centralTax) || 0).toFixed(2),
-                    ExcelIGST: +(Number(l.integratedTax) || 0).toFixed(2),
-                    SAP_SGST: +(Number(inv.sgst) || 0).toFixed(2),
-                    SAP_CGST: +(Number(inv.cgst) || 0).toFixed(2),
-                    SAP_IGST: +(Number(inv.igst) || 0).toFixed(2),
-                    InvoiceDate: l.invoiceDate || inv.docDate || null,
-                    Status: l.matchStatus,
+                    VendorGST: (inv && inv.vendorGstin) || l.vendorGstin || '',
+                    VendorBillNo: (inv && inv.vendorRef) || l.billNumber || '',
+                    VendorName: (inv && inv.vendorName) || l.vendorName || '',
+                    SAP_SGST: +(Number(inv ? inv.sgst : l.sgst) || 0).toFixed(2),
+                    SAP_CGST: +(Number(inv ? inv.cgst : l.cgst) || 0).toFixed(2),
+                    SAP_IGST: +(Number(inv ? inv.igst : l.igst) || 0).toFixed(2),
+                    ExcelGST: l.excelGstin || '',               // what the user typed at manual reconcile
+                    ExcelBill: l.excelBill || '',
+                    InvoiceDate: (inv && (inv.taxDate || inv.docDate)) || l.billDate || null,
+                    ReconciledAt: l.ts || null,
                 };
             });
-        rows.sort((a, b) => String(a.VendorGST).localeCompare(String(b.VendorGST)) || String(a.VendorBillNo).localeCompare(String(b.VendorBillNo)));
-        return { period: { month, year: String(year) }, matched: rows, count: rows.length };
+        rows.sort((a, b) => (new Date(b.ReconciledAt || 0)) - (new Date(a.ReconciledAt || 0)));
+        return { manual: rows, count: rows.length };
+    }
+
+    /**
+     * Project recon_log decisions back onto ap_invoices, flagging each manually
+     * reconciled bill reconciled=true so it leaves the unmatched / payment-gate
+     * list. Skips bills already auto-matched this run (keeps them as auto). Idempotent.
+     */
+    async applyManualReconciliations(companyId) {
+        const entries = await this._manualReconLog(companyId);
+        if (!entries.length) return { applied: 0 };
+        const ops = entries.map((l) => {
+            const [docNo, fiscalYear] = String(l.docNo).split('|');
+            return { updateOne: {
+                filter: { companyId, docNo, fiscalYear, reconciledAuto: { $ne: true } },
+                update: { $set: {
+                    reconciled: true, reconciledAuto: false,
+                    reconciledExcelGstin: l.excelGstin || null,
+                    reconciledExcelBill: l.excelBill || null,
+                    reconciledAt: l.ts || new Date(),
+                } },
+            } };
+        });
+        const res = await collections.apInvoices().bulkWrite(ops, { ordered: false });
+        return { applied: res.modifiedCount };
     }
 
     /** POST /update-status — mark one AP invoice reconciled (manual). */
@@ -550,7 +808,9 @@ class ReconcileService {
                 reconciledExcelGstin: excelGST || null,
                 reconciledExcelBill: excelBill || null,
                 reconciledAt: new Date(),
-            } });
+              },
+              // drop any near-miss tag so the bill leaves the GST/Value/No-Bill buckets
+              $unset: { pairCategory: '', pairedBillNo: '', pairedDate: '' } });
         return { success: true };
     }
 }

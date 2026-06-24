@@ -8,6 +8,9 @@ const endpoints = {
     fetchSapBills: '/api/reconcile/fetch-sap-bills'
 };
 
+// A GSTIN is 15 chars: 2-digit state code + 10-char PAN + 1 entity char + 'Z' + 1 checksum.
+const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+
 const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, source, context, readOnly = false }) => {
     const [expandedVendor, setExpandedVendor] = useState(null);
     const [searchTerm, setSearchTerm] = useState('');
@@ -91,8 +94,14 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
     };
 
     const handleGstBillSubmit = async () => {
-        if (!gstBillData.gst || !gstBillData.bill) {
+        const gst = (gstBillData.gst || '').trim().toUpperCase();
+        const billNo = (gstBillData.bill || '').trim();
+        if (!gst || !billNo) {
             alert('Both GST and Bill fields are required');
+            return;
+        }
+        if (!GSTIN_RE.test(gst)) {
+            alert('Please enter a valid 15-character GSTIN (e.g. 24AAACC1234A1Z5).');
             return;
         }
 
@@ -125,8 +134,8 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
                     SGST: bill.SGST,
                     IGST: bill.IGST,
                     username: username || 'Unknown User',
-                    excelGST: gstBillData.gst, // Add GST data
-                    excelBill: gstBillData.bill // Add Bill data
+                    excelGST: gst, // validated, upper-cased GSTIN
+                    excelBill: billNo
                 })
             });
 
@@ -310,17 +319,26 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
                         <h3 className="text-xl font-bold text-foreground mb-4">Enter Details</h3>
                         <div className="space-y-4">
                             <div>
-                                <label className="block text-sm font-medium text-foreground mb-1">Excel GST:</label>
+                                <label className="block text-sm font-medium text-foreground mb-1">2B GST:</label>
                                 <input
                                     type="text"
                                     value={gstBillData.gst}
-                                    onChange={(e) => setGstBillData({ ...gstBillData, gst: e.target.value })}
-                                    className="h-10 w-full rounded-xl border border-border bg-background px-4 text-sm focus:ring-2 flex items-center"
+                                    onChange={(e) => setGstBillData({ ...gstBillData, gst: e.target.value.toUpperCase() })}
+                                    maxLength={15}
+                                    placeholder="e.g. 24AAACC1234A1Z5"
+                                    className={`h-10 w-full rounded-xl border bg-background px-4 text-sm focus:ring-2 flex items-center ${
+                                        gstBillData.gst && !GSTIN_RE.test(gstBillData.gst.trim().toUpperCase())
+                                            ? 'border-destructive focus:ring-destructive/30'
+                                            : 'border-border'
+                                    }`}
                                     required
                                 />
+                                {gstBillData.gst && !GSTIN_RE.test(gstBillData.gst.trim().toUpperCase()) && (
+                                    <p className="text-xs text-destructive mt-1">Enter a valid 15-character GSTIN.</p>
+                                )}
                             </div>
                             <div>
-                                <label className="block text-sm font-medium text-foreground mb-1">Excel Bill:</label>
+                                <label className="block text-sm font-medium text-foreground mb-1">2B Bill:</label>
                                 <input
                                     type="text"
                                     value={gstBillData.bill}
@@ -339,7 +357,8 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
                             </button>
                             <button
                                 onClick={handleGstBillSubmit}
-                                className="px-4 py-2 rounded-xl border border-border bg-primary text-primary-foreground hover:bg-primary/90 transition-colors text-sm font-medium shadow-sm"
+                                disabled={!GSTIN_RE.test((gstBillData.gst || '').trim().toUpperCase()) || !(gstBillData.bill || '').trim()}
+                                className="px-4 py-2 rounded-xl border border-border bg-primary text-primary-foreground hover:bg-primary/90 transition-colors text-sm font-medium shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 Submit
                             </button>

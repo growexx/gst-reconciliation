@@ -19,6 +19,8 @@ router.delete('/delete/:periodId', reconcile.deletePeriod.bind(reconcile));
 router.get('/fetch-sap-bills', reconcile.fetchBills.bind(reconcile));
 router.get('/unmatched-sections', reconcile.fetchUnmatchedSections.bind(reconcile));
 router.get('/matched-bills', reconcile.fetchMatchedBills.bind(reconcile));
+router.get('/tax-mismatch-bills', reconcile.fetchTaxMismatchBills.bind(reconcile));
+router.get('/manual-matched-bills', reconcile.fetchManualMatchedBills.bind(reconcile));
 router.post('/update-status', reconcile.updateBillStatus.bind(reconcile));
 
 module.exports = router;
