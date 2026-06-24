@@ -352,13 +352,26 @@ class ReconcileService {
      * and return the unmatched bills.
      */
     async importPortalFile(fileBuffer, companyId, month, year, sessionId, onProgress) {
-        // 1. Upsert the period; clear any previous lines for a clean re-upload.
-        let period = await this.getPeriod(companyId, month, year);
-        if (period) {
-            await collections.lines().deleteMany({ periodId: period._id });
+        // 1. A re-upload must REPLACE this month's 2B lines, never accumulate. Match
+        //    EVERY period doc for this company+month+year (year stored as string OR
+        //    number, to catch legacy/duplicate periods), delete ALL their lines, and
+        //    collapse to a single period. This prevents a stray duplicate period from
+        //    leaving an un-deleted copy of the lines behind on each run.
+        const ystr = String(year);
+        const periods = await collections.periods()
+            .find({ companyId, month, year: { $in: [ystr, Number(year)] } }).toArray();
+        let period;
+        if (periods.length) {
+            const ids = periods.map((p) => p._id);
+            await collections.lines().deleteMany({ periodId: { $in: ids } });
+            period = periods[0];
+            if (periods.length > 1) {                                  // keep one, drop duplicates
+                await collections.periods().deleteMany({ _id: { $in: ids.slice(1) } });
+            }
+            if (period.year !== ystr) await collections.periods().updateOne({ _id: period._id }, { $set: { year: ystr } });
         } else {
             const res = await collections.periods().insertOne({
-                companyId, month, year: String(year), source: '2B', createdAt: new Date(),
+                companyId, month, year: ystr, source: '2B', createdAt: new Date(),
             });
             period = { _id: res.insertedId };
         }
