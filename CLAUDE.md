@@ -68,17 +68,25 @@ Matching lives in two layers and the distinction matters:
   - **T2** GSTIN + invoice-no only — matched, but flagged `Match-Review` if
     tax/date drift out of tolerance
   - **T3** GSTIN + tax(±5) + date(±10), no invoice-no
-  - **T4** invoice-no + tax(±5), **no GSTIN constraint** — the line's 2B GSTIN is
-    then *adopted* onto the invoice (`backfillGstin`)
+  - **T4** invoice-no + tax(±5) for a GSTIN-less bill — the line's 2B GSTIN is
+    *adopted* onto the invoice (`backfillGstin`), **but only when the vendor is
+    positively confirmed**: the bill's RBKP-reserve GSTIN equals the 2B GSTIN, or a
+    vendor name agrees (the bill's own SAP/BSEG name, or the 2B GSTIN's name in the
+    SAP vendor master). **Vendor identity (GSTIN or name) is mandatory — a bill never
+    matches on bill-no + amount + date alone.** Name agreement is strict (equal/
+    contained cores, or all significant tokens align — not just one shared word).
 - [reconcileService.js](server/modules/reconcile/reconcileService.js) `importPortalFile`
   — the **orchestration** that runs the matcher twice:
   - **Stage 1**: candidates restricted to `source==='BKPF'` invoices.
   - **Stage 2**: leftover lines re-matched against RBKP-sourced invoices plus
     BKPF leftovers "promoted" with their reserved `rbkpGstin`. RBKP only ever acts
     as a fallback to supply a vendor/GSTIN that BSEG/ACDOCA didn't.
-  - **Sibling propagation** (step 8b): a still-GSTIN-less BKPF doc adopts a
-    resolved sibling's vendor when they share a normalized invoice no and that
-    invoice no maps to exactly one GSTIN.
+  - **No sibling propagation.** A bill's vendor is decided by matching alone. A
+    GSTIN-less bill that didn't match stays GSTIN-less — it never borrows the
+    vendor of another bill that merely shares an invoice-number string (that
+    inference spread one match's GSTIN onto unrelated, different-amount bills).
+    Bills with a GSTIN but no name still get their name resolved from the vendor
+    master by GSTIN at read time (display only — see `_vendorByGstin`).
 
 **Determinism is a hard requirement.** Re-running the same 2B file must produce
 the identical result. Two mechanisms enforce this and must be preserved:
@@ -117,8 +125,8 @@ the repo**) and upserts `ap_invoices`. BKPF is the primary source; only document
 types `RE` (MM invoice) and `KR` (FI invoice) are kept — credit memos (`KG`) and
 everything else are excluded because they reconcile against the 2B CDNR section,
 not B2B. RBKP is loaded as a stage-2 fallback / GSTIN-reserve only. Most BKPF docs
-have no SAP vendor line, so they load GSTIN-less and rely on T4 / RBKP / sibling
-resolution at match time.
+have no SAP vendor line, so they load GSTIN-less and rely on T4 / RBKP resolution
+at match time; if neither resolves them they stay GSTIN-less (no sibling guessing).
 
 ### Request flow
 

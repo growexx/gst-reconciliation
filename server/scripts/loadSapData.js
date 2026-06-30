@@ -30,17 +30,22 @@ const arg = (name, def) => { const i = process.argv.indexOf(name); return i !== 
 const COMPANY = arg('--company', (process.env.COMPANIES || 'Nandan Terry').split(',')[0].trim());
 const FRESH = process.argv.includes('--fresh');
 
-// BKPF source (the agreed vendor-invoice source). Override via SAP_BKPF_FILE.
-const BKPF_FILE = { file: process.env.SAP_BKPF_FILE || 'bkpf smaller.xlsx', dir: ROOT, sheet: null };
+// BKPF source (the agreed vendor-invoice source) — the FULL extract. Override via
+// SAP_BKPF_FILE. ('bkpf smaller.xlsx' was a partial subset; do not use it.)
+const BKPF_FILE = { file: process.env.SAP_BKPF_FILE || 'BKPF Full Data.xlsx', dir: ROOT, sheet: null };
 const BSET_FILES = [{ file: 'BSET data.xlsx', dir: NT }, { file: 'BSET data.xlsx', dir: ROOT }];
-const BSEG_FILES = [{ file: 'BSEG data.xlsx', dir: NT }];
+// Both the NT and the root BSEG extracts are needed — the root file holds vendor
+// lines (≈34 docs) that the NT extract is missing. buildVendorByDoc unions them
+// (first-seen per document wins; later files only add documents not already present).
+const BSEG_FILES = [{ file: 'BSEG data.xlsx', dir: NT }, { file: 'BSEG data.xlsx', dir: ROOT }];
 const ACDOCA_FILE = { file: 'ACDOCA.xlsx', dir: ROOT };
 const LFA1_GST = { file: 'LFA1 DATA GST.xlsx', dir: ROOT };
-// RBKP is NOT a primary source — used only as a FALLBACK to fill the vendor
-// code/GSTIN for BKPF docs that have no SAP vendor line (matched by reference + tax).
-// Use the lean NT RBKP only (the BKPK workbook also carries a 159k-row BKPF sheet
-// that would blow memory when its workbook is opened).
-const RBKP_FILES = [{ file: 'RBKP Data.xlsx', dir: NT }];
+// RBKP is NOT a primary source — used (a) as a FALLBACK to fill the vendor code/GSTIN
+// for BKPF docs with no SAP vendor line, and (b) for RBKP-only bills not in BKPF at all
+// (matched by reference + tax). 'RBKP Data Full.xlsx' is the COMPLETE extract (its 4760
+// RE rows == the old NT file + the april-26 workbook sheet combined), so it replaces
+// both partials. Columns: Reference @7, Inv. Pty @9, VAT @160, Tax,error @173.
+const RBKP_FILES = [{ file: 'RBKP Data Full.xlsx', dir: ROOT }];
 // Document types loaded from BKPF, and which GSTR-2B section each reconciles against:
 //   RE = MM invoice, KR = FI invoice  -> B2B section   (vendor invoices)
 //   KG = credit/debit note            -> B2B-CDNR section
@@ -54,7 +59,13 @@ function read({ file, dir, sheet }) {
   // shifts every date back ~5.5h (+a rounding error) — e.g. a Doc. Date of
   // 01-05-2026 becomes 2026-04-30T18:29:50Z and reads as April. We instead keep
   // the raw serial and decode it ourselves (see toDate), which is timezone-safe.
-  const wb = XLSX.readFile(path.join(dir, file));
+  // When a sheet is named, parse ONLY that sheet so a workbook that also holds a
+  // huge tab (e.g. a 159k-row BKPF sheet) isn't loaded into memory.
+  // dense:true stores the sheet as a 2D array — the full BKPF (≈413k rows × 22 cols)
+  // reads in ~1 min this way; the default cell-by-cell object build stalls on it.
+  const opts = { dense: true };
+  if (sheet) opts.sheets = sheet;
+  const wb = XLSX.readFile(path.join(dir, file), opts);
   const sn = sheet && wb.Sheets[sheet] ? sheet : wb.SheetNames[0];
   return XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: null, blankrows: false });
 }
@@ -140,7 +151,9 @@ function buildRbkpIndex(vendorMaster) {
   const idx = new Map();
   for (const src of RBKP_FILES) {
     let rows; try { rows = read(src); } catch { continue; }
-    const R = { doc: 0, year: 1, type: 2, ref: 7, pty: 9, rvrsd: 18, vat: 160 };
+    // RBKP total input tax = VAT + Tax-error (SAP splits part of the tax into the
+    // 'Tax, error' column; the deductible total is the sum of both).
+    const R = { doc: 0, year: 1, type: 2, ref: 7, pty: 9, rvrsd: 18, vat: 160, taxerr: 173 };
     const reverser = new Set(rows.slice(1).map((r) => r[R.rvrsd]).filter(Boolean).map(String));
     for (const r of rows.slice(1)) {
       if (r[R.type] !== 'RE') continue;
@@ -148,19 +161,20 @@ function buildRbkpIndex(vendorMaster) {
       const nref = normalizeInvoiceNum(r[R.ref]); if (!nref) continue;
       const code = String(r[R.pty]); const vm = vendorMaster.get(code) || { gstin: '', name: '' };
       if (!vm.gstin) continue; // only useful if it yields a GSTIN
-      (idx.get(nref) || idx.set(nref, []).get(nref)).push({ code, gstin: vm.gstin, name: vm.name, tax: +num(r[R.vat]).toFixed(2) });
+      const tax = +(num(r[R.vat]) + num(r[R.taxerr])).toFixed(2);
+      (idx.get(nref) || idx.set(nref, []).get(nref)).push({ code, gstin: vm.gstin, name: vm.name, tax });
     }
   }
   return idx;
 }
 
 // RBKP-only invoices (reference NOT already in BKPF) as stage-2 fallback
-// candidates: source='RBKP', GSTIN from LFA1, tax = RBKP VAT total.
+// candidates: source='RBKP', GSTIN from LFA1, tax = RBKP VAT + Tax-error total.
 function buildRbkpOnlyInvoices(bkpfRefs, vendorMaster) {
   const out = []; const seen = new Set();
   for (const src of RBKP_FILES) {
     let rows; try { rows = read(src); } catch { continue; }
-    const R = { doc: 0, year: 1, type: 2, ref: 7, pty: 9, rvrsd: 18, docDate: 151, gross: 156, vat: 160 };
+    const R = { doc: 0, year: 1, type: 2, ref: 7, pty: 9, rvrsd: 18, docDate: 151, gross: 156, vat: 160, taxerr: 173 };
     const reverser = new Set(rows.slice(1).map((r) => r[R.rvrsd]).filter(Boolean).map(String));
     for (const r of rows.slice(1)) {
       if (r[R.type] !== 'RE') continue;
@@ -177,7 +191,7 @@ function buildRbkpOnlyInvoices(bkpfRefs, vendorMaster) {
         vendorCode: code, vendorName: vm.name || '', vendorGstin: vm.gstin || '', gstinSource: vm.gstin ? 'RBKP-master' : null,
         vendorRef: r[R.ref] != null ? String(r[R.ref]) : '', normalizedInvoiceNum: nref,
         docDate, taxDate: docDate, grossAmount: +num(r[R.gross]).toFixed(2),
-        tax: +num(r[R.vat]).toFixed(2), cgst: 0, sgst: 0, igst: 0,   // split not available (not in BKPF/BSET)
+        tax: +(num(r[R.vat]) + num(r[R.taxerr])).toFixed(2), cgst: 0, sgst: 0, igst: 0,   // VAT + Tax-error; split not available
         cancelled: false,
       });
     }
@@ -218,9 +232,12 @@ function buildBkpfInvoices(bsetSplit, vendorByDoc, vendorMaster, rbkpByRef) {
     let rbkpVendorCode = '', rbkpGstin = '', rbkpVendorName = '';
     const cands = rbkpByRef.get(nref);
     if (cands && cands.length) {
+      // Adopt an RBKP vendor ONLY when its tax actually matches (within ±5). A generic
+      // invoice ref (e.g. "5/26-27", reused by many vendors) must not pull in a vendor
+      // whose amount is different. (Previously a lone candidate was taken regardless of
+      // tax, which attached one vendor's RBKP row to unrelated, different-amount bills.)
       const within = cands.filter((c) => Math.abs(c.tax - tax) <= 5);
-      const pick = (within.length ? within : (cands.length === 1 ? cands : []))
-        .reduce((a, b) => (a && Math.abs(a.tax - tax) <= Math.abs(b.tax - tax)) ? a : b, null);
+      const pick = within.reduce((a, b) => (a && Math.abs(a.tax - tax) <= Math.abs(b.tax - tax)) ? a : b, null);
       if (pick) { rbkpVendorCode = pick.code; rbkpGstin = pick.gstin; rbkpVendorName = pick.name; stat.fromRbkp++; }
     }
 

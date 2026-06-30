@@ -11,7 +11,7 @@ const endpoints = {
 // A GSTIN is 15 chars: 2-digit state code + 10-char PAN + 1 entity char + 'Z' + 1 checksum.
 const GSTIN_RE = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
 
-const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, source, context, readOnly = false }) => {
+const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, source, context, readOnly = false, serverPaged = false }) => {
     const [expandedVendor, setExpandedVendor] = useState(null);
     const [searchTerm, setSearchTerm] = useState('');
     const [reconciledBills, setReconciledBills] = useState(new Set()); // Track reconciled bills
@@ -38,22 +38,26 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
         const billDate = new Date(bill.DocDate);
         if (billDate < FILTER_DATE) return acc;
 
-        const vendorCode = bill.CardCode || bill.VendorCode;
+        // Group by vendor code; fall back to GSTIN, then vendor name, so a GSTIN-only or
+        // name-only bill is never collapsed under one catch-all key (the literal
+        // "undefined" / "—") and mislabelled by another vendor.
+        const vendorKey = bill.CardCode || bill.VendorCode || bill.GSTRegnNo || bill.VendorGST || bill.CardName || bill.VendorName || '—';
         const billNumber = bill.NumAtCard || '';
         const term = searchTerm.toLowerCase();
-        const vendorMatch = String(vendorCode || '').toLowerCase().includes(term) ||
+        const vendorMatch = String(vendorKey).toLowerCase().includes(term) ||
             String(bill.CardName || bill.VendorName || '').toLowerCase().includes(term);
         const billNumberMatch = String(billNumber).toLowerCase().includes(term);
 
         if (vendorMatch || billNumberMatch) {
-            if (!acc[vendorCode]) {
-                acc[vendorCode] = {
-                    vendorName: bill.CardName || bill.VendorName,
-                    vendorGST: bill.GSTRegnNo || bill.VendorGST,
+            if (!acc[vendorKey]) {
+                acc[vendorKey] = {
+                    vendorCode: bill.CardCode || bill.VendorCode || '',
+                    vendorName: bill.CardName || bill.VendorName || 'Unknown vendor',
+                    vendorGST: bill.GSTRegnNo || bill.VendorGST || '',
                     bills: []
                 };
             }
-            acc[vendorCode].bills.push(bill);
+            acc[vendorKey].bills.push(bill);
         }
         return acc;
     }, {});
@@ -73,10 +77,14 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
         setCurrentPage(1);
     }, [itemsPerPage, searchTerm]);
 
-    // Calculate the current vendors to display based on pagination
+    // Calculate the current vendors to display based on pagination. When the rows are
+    // already one server page (serverPaged), show every vendor in the page — the parent
+    // owns paging, so the internal vendor pager is suppressed below.
     const indexOfLastVendor = currentPage * itemsPerPage;
     const indexOfFirstVendor = indexOfLastVendor - itemsPerPage;
-    const currentVendors = filteredVendors.slice(indexOfFirstVendor, indexOfLastVendor);
+    const currentVendors = serverPaged
+        ? filteredVendors
+        : filteredVendors.slice(indexOfFirstVendor, indexOfLastVendor);
 
     const formatAmount = (amount) => {
         if (amount === undefined || amount === null) return "N/A";
@@ -299,16 +307,18 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
                         </select>
                     )}
 
-                    <div className="relative w-full sm:w-64">
-                        <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground w-4 h-4" />
-                        <input
-                            type="text"
-                            placeholder="Search Vendor / Bill No."
-                            value={searchTerm}
-                            onChange={(e) => setSearchTerm(e.target.value)}
-                            className="h-10 w-full rounded-xl border border-border bg-card pl-10 pr-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground outline-none shadow-sm"
-                        />
-                    </div>
+                    {!serverPaged && (
+                        <div className="relative w-full sm:w-64">
+                            <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground w-4 h-4" />
+                            <input
+                                type="text"
+                                placeholder="Search Vendor / Bill No."
+                                value={searchTerm}
+                                onChange={(e) => setSearchTerm(e.target.value)}
+                                className="h-10 w-full rounded-xl border border-border bg-card pl-10 pr-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground outline-none shadow-sm"
+                            />
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -387,7 +397,7 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
                                 <div>
                                     <h3 className="text-lg font-bold text-foreground">{data.vendorName}</h3>
                                     <div className="text-sm text-muted-foreground mt-1 flex items-center gap-2">
-                                        <span className="bg-muted px-2 py-0.5 rounded-md font-medium text-xs">{vendorCode}</span>
+                                        <span className="bg-muted px-2 py-0.5 rounded-md font-medium text-xs">{data.vendorCode || '—'}</span>
                                         <span>•</span>
                                         <span>GST: <span className="text-foreground">{data.vendorGST || 'N/A'}</span></span>
                                         <span>•</span>
@@ -485,8 +495,8 @@ const UnmatchedBills = ({ unmatchedBills: initialUnmatchedBills, onReconcile, so
                 </div>
             )}
 
-            {/* Pagination Controls */}
-            {filteredVendors.length > 0 && (
+            {/* Pagination Controls — hidden when the parent paginates server-side */}
+            {!serverPaged && filteredVendors.length > 0 && (
                 <Pagination
                     currentPage={currentPage}
                     totalPages={totalPages}

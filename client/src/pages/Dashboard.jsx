@@ -1,13 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { useSearchParams } from 'react-router-dom';
 import * as XLSX from 'xlsx';
-import { FiX, FiLogOut } from 'react-icons/fi';
+import { FiX, FiLogOut, FiSearch } from 'react-icons/fi';
 import { useAuth } from '../context/AuthContext';
 
 import FileUpload from '../components/FileUpload';
 import UnmatchedBills from '../components/UnmatchedBills';
 import ExcelPreview from '../components/ExcelPreview';
+import Pagination from '../components/common/Pagination';
 
 const endpoints = {
   reconcile: '/api/reconcile/upload',
@@ -23,6 +24,9 @@ const TABS = [
 // Valid sub-section keys per tab — used to validate/restore the ?section= query param.
 const UNMATCHED_KEYS = ['sap', '2b', 'gstdiff', 'valuediff', 'vendordiff', 'nobill', 'debit'];
 const MATCHED_KEYS = ['matched', 'datediff', 'manual'];
+
+// Default rows/page per top-level tab (user can still change it via the Pagination control).
+const defaultPageSize = (t) => (t === 'matched' ? 15 : 10);
 
 // Download an array of plain row objects as an .xlsx file (uses the bundled xlsx lib).
 const fmtXlsDate = (x) => (x ? new Date(x).toLocaleDateString('en-GB') : '');
@@ -59,16 +63,19 @@ export default function Dashboard() {
   const [selectedMonth, setSelectedMonth] = useState('');
   const [unmatchedBills, setUnmatchedBills] = useState([]);
 
-  // "Unmatched bills" view — sections, scoped to the reconciled period
-  const [sections, setSections] = useState({ inSapNotIn2b: [], in2bNotInSap: [], gstDiff: [], valueDiff: [], vendorDiff: [], noBillNo: [], debitNotes: [], cdnr2bNotInSap: [], counts: {}, period: {} });
-  const [matched, setMatched] = useState({ match: [], dateDiff: [], count: 0 });
-  const [manualMatched, setManualMatched] = useState({ rows: [], count: 0 });
-  const [matchedSearch, setMatchedSearch] = useState('');
-  // sap | 2b | gstdiff | valuediff | nobill | debit | matched | datediff | manual
+  // Paginated bills view: counts drive the badges; only the open category's current
+  // page of rows is loaded at a time.
+  const [counts, setCounts] = useState({});
+  const [sectionData, setSectionData] = useState({ rows: [], total: 0, page: 1, pageSize: defaultPageSize(qsTab), groupBy: 'row' });
+  const [pageSize, setPageSize] = useState(defaultPageSize(qsTab));
+  const [search, setSearch] = useState('');
+  const searchInit = useRef(true);   // skip the debounce effect's first (mount) run
+  // sap | 2b | gstdiff | valuediff | vendordiff | nobill | debit | matched | datediff | manual
   const [unmatchedSection, setUnmatchedSection] = useState(qsSection);
   const [filterMonth, setFilterMonth] = useState(searchParams.get('month') || 'All');
   const [filterYear, setFilterYear] = useState(searchParams.get('year') || localStorage.getItem('selectedYear') || '2026');
-  const [loadingAll, setLoadingAll] = useState(false);
+  const [loadingCounts, setLoadingCounts] = useState(false);
+  const [loadingSection, setLoadingSection] = useState(false);
 
   const handleFileUpload = (file, month) => {
     setUploadedFile(file);
@@ -90,48 +97,48 @@ export default function Dashboard() {
     reader.readAsArrayBuffer(uploadedFile);
   };
 
-  const loadAllBills = async (month = filterMonth, year = filterYear) => {
-    setLoadingAll(true);
+  const authHeaders = () => ({
+    Authorization: `Bearer ${localStorage.getItem('sessionId')}`,
+    'X-Database': localStorage.getItem('database'),
+  });
+
+  // Just the per-category counts (for the tab badges) — small, no rows.
+  const loadCounts = async (month = filterMonth, year = filterYear) => {
+    setLoadingCounts(true);
     try {
-      const headers = {
-        Authorization: `Bearer ${localStorage.getItem('sessionId')}`,
-        'X-Database': localStorage.getItem('database'),
-      };
-      const qs = `month=${encodeURIComponent(month)}&year=${encodeURIComponent(year)}`;
-      const [uRes, mRes, mmRes] = await Promise.all([
-        fetch(`/api/reconcile/unmatched-sections?${qs}`, { headers }),
-        fetch(`/api/reconcile/matched-bills?${qs}`, { headers }),
-        fetch(`/api/reconcile/manual-matched-bills`, { headers }),
-      ]);
-      const data = await uRes.json();
-      const mData = await mRes.json();
-      const mmData = await mmRes.json();
-      setSections({
-        inSapNotIn2b: data.inSapNotIn2b || [],
-        in2bNotInSap: data.in2bNotInSap || [],
-        gstDiff: data.gstDiff || [],
-        valueDiff: data.valueDiff || [],
-        vendorDiff: data.vendorDiff || [],
-        noBillNo: data.noBillNo || [],
-        debitNotes: data.debitNotes || [],
-        cdnr2bNotInSap: data.cdnr2bNotInSap || [],
-        counts: data.counts || {},
-        period: data.period || {},
-      });
-      setMatched({ match: mData.match || [], dateDiff: mData.dateDiff || [], count: mData.count || 0 });
-      setManualMatched({ rows: mmData.manual || [], count: mmData.count || 0 });
-    } catch (e) {
-      alert(`Error: ${e.message}`);
-    } finally {
-      setLoadingAll(false);
-    }
+      const r = await fetch(`/api/reconcile/bill-counts?month=${encodeURIComponent(month)}&year=${encodeURIComponent(year)}`, { headers: authHeaders() });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Failed to load counts');
+      setCounts(d.counts || {});
+    } catch (e) { alert(`Error: ${e.message}`); } finally { setLoadingCounts(false); }
+  };
+
+  // One page of one category — only loaded when that category is open. Search (q)
+  // and page size are sent to the server so they apply across the whole bucket.
+  const loadSection = async (key, page = 1, month = filterMonth, year = filterYear, q = search, size = pageSize) => {
+    setUnmatchedSection(key);
+    setLoadingSection(true);
+    try {
+      const qs = `key=${key}&month=${encodeURIComponent(month)}&year=${encodeURIComponent(year)}&page=${page}&pageSize=${size}&q=${encodeURIComponent(q)}`;
+      const r = await fetch(`/api/reconcile/bill-page?${qs}`, { headers: authHeaders() });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Failed to load page');
+      setSectionData({ rows: d.rows || [], total: d.total || 0, page: d.page || page, pageSize: d.pageSize || size, groupBy: d.groupBy || 'row' });
+    } catch (e) { alert(`Error: ${e.message}`); } finally { setLoadingSection(false); }
+  };
+
+  // Rows-per-page change from the Pagination control — reset to page 1 at the new size.
+  const changePageSize = (size) => {
+    setPageSize(size);
+    loadSection(unmatchedSection, 1, filterMonth, filterYear, search, size);
   };
 
   // Re-fetch when the month/year filter changes (only while viewing the tab).
   const changeFilter = (month, year) => {
     setFilterMonth(month);
     setFilterYear(year);
-    loadAllBills(month, year);
+    loadCounts(month, year);
+    loadSection(unmatchedSection, 1, month, year);
   };
 
   // Manually reconcile a near-miss row (GST-Diff / Value-Diff). The bill no. already
@@ -162,14 +169,17 @@ export default function Dashboard() {
         }),
       });
       if (!res.ok) throw new Error('Failed to reconcile');
-      loadAllBills();
+      loadCounts();
+      loadSection(unmatchedSection, sectionData.page);
     } catch (e) { alert(`Error: ${e.message}`); }
   };
 
   const onTab = (key) => {
     setTab(key);
-    if (key === 'unmatched') { setUnmatchedSection('sap'); loadAllBills(); }
-    else if (key === 'matched') { setUnmatchedSection('matched'); loadAllBills(); }
+    const size = defaultPageSize(key);
+    setPageSize(size);
+    if (key === 'unmatched') { loadCounts(); loadSection('sap', 1, filterMonth, filterYear, search, size); }
+    else if (key === 'matched') { loadCounts(); loadSection('matched', 1, filterMonth, filterYear, search, size); }
   };
 
   // Mirror the current view into the URL query string (replace, so it doesn't spam
@@ -187,48 +197,68 @@ export default function Dashboard() {
   // On first load (e.g. a refresh on ?tab=unmatched), fetch the bills for that tab so
   // we stay put instead of falling back to an empty Reconcile view.
   useEffect(() => {
-    if (qsTab === 'unmatched' || qsTab === 'matched') loadAllBills(filterMonth, filterYear);
+    if (qsTab === 'unmatched' || qsTab === 'matched') { loadCounts(filterMonth, filterYear); loadSection(qsSection, 1, filterMonth, filterYear, search, defaultPageSize(qsTab)); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Debounced server-side search: re-fetch the open category (page 1) as the user types.
+  // The category badges keep showing the full, unfiltered totals.
+  useEffect(() => {
+    if (searchInit.current) { searchInit.current = false; return; }
+    if (tab !== 'unmatched' && tab !== 'matched') return;
+    const t = setTimeout(() => loadSection(unmatchedSection, 1), 300);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
+
   // Sub-section tabs, with live counts, grouped by the top-level tab they belong to.
   const UNMATCHED_SECTIONS = [
-    { key: 'sap', label: 'In SAP, not in 2B', count: sections.counts.inSapNotIn2b || 0 },
-    { key: '2b', label: 'In 2B, not in SAP', count: sections.counts.in2bNotInSap || 0 },
-    { key: 'gstdiff', label: 'Not Matched — GST diff', count: sections.counts.gstDiff || 0 },
-    { key: 'valuediff', label: 'Not Matched — Value diff', count: sections.counts.valueDiff || 0 },
-    { key: 'vendordiff', label: 'Not Matched — Diff Vendor Name', count: sections.counts.vendorDiff || 0 },
-    { key: 'nobill', label: 'Not Matched — Diff Bill No', count: sections.counts.noBillNo || 0 },
-    { key: 'debit', label: 'Not Matched — Debit Note', count: sections.counts.debitNotes || 0 },
+    { key: 'sap', label: 'In SAP, not in 2B', count: counts.inSapNotIn2b || 0 },
+    { key: '2b', label: 'In 2B, not in SAP', count: counts.in2bNotInSap || 0 },
+    { key: 'gstdiff', label: 'Not Matched — GST diff', count: counts.gstDiff || 0 },
+    { key: 'valuediff', label: 'Not Matched — Value diff', count: counts.valueDiff || 0 },
+    { key: 'vendordiff', label: 'Not Matched — Diff Vendor Name', count: counts.vendorDiff || 0 },
+    { key: 'nobill', label: 'Not Matched — Diff Bill No', count: counts.noBillNo || 0 },
+    { key: 'debit', label: 'Not Matched — Debit Note', count: counts.debitNotes || 0 },
   ];
   const MATCHED_SECTIONS = [
-    { key: 'matched', label: 'Matched', count: (matched.match || []).length },
-    { key: 'datediff', label: 'Matched — Date diff', count: (matched.dateDiff || []).length },
-    { key: 'manual', label: 'Manually matched', count: manualMatched.count || 0 },
+    { key: 'matched', label: 'Matched', count: counts.matched || 0 },
+    { key: 'datediff', label: 'Matched — Date diff', count: counts.dateDiff || 0 },
+    { key: 'manual', label: 'Manually matched', count: counts.manual || 0 },
   ];
   const SECTION_TABS = tab === 'matched' ? MATCHED_SECTIONS : UNMATCHED_SECTIONS;
 
   // If the active sub-section has no bills (its tab is hidden), jump to the first
-  // visible one so we never sit on an empty, hidden category.
+  // visible one and load it, so we never sit on an empty, hidden category.
   useEffect(() => {
     const visible = SECTION_TABS.filter((t) => t.count > 0);
     if (visible.length && !visible.some((t) => t.key === unmatchedSection)) {
-      setUnmatchedSection(visible[0].key);
+      loadSection(visible[0].key, 1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, unmatchedSection, sections, matched, manualMatched]);
+  }, [counts, tab]);
 
   // Financial-year months (Apr→Mar) for the month filter; '' = whole window.
   const MONTHS_LIST = ['Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 'Jan', 'Feb', 'Mar'];
-  // The "joined-row" buckets (2B line ↔ SAP invoice) share one table.
-  const joinedRows = unmatchedSection === 'matched' ? matched.match
-    : unmatchedSection === 'datediff' ? matched.dateDiff
-    : unmatchedSection === 'gstdiff' ? sections.gstDiff
-    : unmatchedSection === 'valuediff' ? sections.valueDiff
-    : unmatchedSection === 'vendordiff' ? sections.vendorDiff
-    : unmatchedSection === 'nobill' ? sections.noBillNo : null;
+  // The matched / near-miss buckets render as a joined row table (current page only).
+  const JOINED_KEYS = ['matched', 'datediff', 'gstdiff', 'valuediff', 'vendordiff', 'nobill'];
+  const joinedRows = JOINED_KEYS.includes(unmatchedSection) ? sectionData.rows : null;
   // The not-matched near-miss buckets allow a manual reconcile straight from the table.
   const joinedReconcilable = ['gstdiff', 'valuediff', 'vendordiff', 'nobill'].includes(unmatchedSection);
+  const totalPages = Math.max(1, Math.ceil((sectionData.total || 0) / (sectionData.pageSize || defaultPageSize(tab))));
+  // Pagination control under each list/table. totalItems is vendors (for the grouped
+  // SAP/2B lists) or rows (matched / near-miss / manual tables).
+  const renderPager = () => sectionData.total > 0 ? (
+    <Pagination
+      currentPage={sectionData.page}
+      totalPages={totalPages}
+      onPageChange={(p) => loadSection(unmatchedSection, p)}
+      totalItems={sectionData.total}
+      pageSize={sectionData.pageSize}
+      onPageSizeChange={changePageSize}
+      className="mt-6 px-2"
+    />
+  ) : null;
   const SECTION_DESC = {
     sap: 'Bills booked in SAP whose ITC is not confirmed in the 2B — hold / review before payment.',
     '2b': 'Invoices the supplier reported in the 2B that are not booked in SAP — verify / book.',
@@ -242,35 +272,43 @@ export default function Dashboard() {
     manual: 'Bills reconciled manually by a user (with the 2B GSTIN / bill they entered).',
   };
 
-  // Export the currently-shown section to an .xlsx file, with clean column names.
-  const exportCurrent = () => {
+  // Export the ENTIRE current section (not just the visible page) to an .xlsx.
+  const [exporting, setExporting] = useState(false);
+  const exportCurrent = async () => {
     const fname = `gst-${tab}-${unmatchedSection}-${filterMonth}-${filterYear}.xlsx`;
-    if (joinedRows) {
-      downloadXlsx(joinedRows.map((r) => ({
-        '2B GSTIN': r.VendorGST, 'SAP GSTIN': r.SapGST,
-        '2B Vendor': r.Vendor2BName, 'SAP Vendor': r.SapVendorName,
-        '2B Bill No': r.VendorBillNo, 'SAP Bill No': r.SapBillNo,
-        '2B Tax': r.ExcelTax, 'SAP Tax': r.SAP_Tax, 'Tax Diff': r.TaxDelta,
-        '2B Date': fmtXlsDate(r.InvoiceDate), 'SAP Date': fmtXlsDate(r.SapDate), 'Days Diff': r.DateDeltaDays,
-      })), fname);
-    } else if (unmatchedSection === 'manual') {
-      downloadXlsx((manualMatched.rows || []).map((r) => ({
-        'Vendor GST': r.VendorGST, 'Vendor Bill No': r.VendorBillNo,
-        'SAP SGST': r.SAP_SGST, 'SAP CGST': r.SAP_CGST, 'SAP IGST': r.SAP_IGST,
-        '2B GST (entered)': r.ExcelGST, '2B Bill (entered)': r.ExcelBill,
-        'Invoice Date': fmtXlsDate(r.InvoiceDate), 'Reconciled On': fmtXlsDate(r.ReconciledAt),
-      })), fname);
-    } else {
-      const rows = unmatchedSection === 'sap' ? sections.inSapNotIn2b
-        : unmatchedSection === 'debit' ? sections.debitNotes
-        : sections.in2bNotInSap;
-      downloadXlsx((rows || []).map((r) => ({
-        'Vendor Code': r.CardCode, 'Vendor Name': r.CardName,
-        'GSTIN': r.GSTRegnNo || r.VendorGST, 'Bill No': r.NumAtCard,
-        'Date': fmtXlsDate(r.DocDate), 'Total': r.DocTotal,
-        'CGST': r.CGST, 'SGST': r.SGST, 'IGST': r.IGST, 'Tax': r.Tax, 'Reason': r.Reason,
-      })), fname);
-    }
+    setExporting(true);
+    try {
+      // pull every row for this category (big page size) so the file is complete;
+      // honour the active search so the export matches what's on screen
+      const qs = `key=${unmatchedSection}&month=${encodeURIComponent(filterMonth)}&year=${encodeURIComponent(filterYear)}&page=1&pageSize=100000&q=${encodeURIComponent(search)}`;
+      const r = await fetch(`/api/reconcile/bill-page?${qs}`, { headers: authHeaders() });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || 'Export failed');
+      const rows = d.rows || [];
+      if (JOINED_KEYS.includes(unmatchedSection)) {
+        downloadXlsx(rows.map((x) => ({
+          '2B GSTIN': x.VendorGST, 'SAP GSTIN': x.SapGST,
+          '2B Vendor': x.Vendor2BName, 'SAP Vendor': x.SapVendorName,
+          '2B Bill No': x.VendorBillNo, 'SAP Bill No': x.SapBillNo,
+          '2B Tax': x.ExcelTax, 'SAP Tax': x.SAP_Tax, 'Tax Diff': x.TaxDelta,
+          '2B Date': fmtXlsDate(x.InvoiceDate), 'SAP Date': fmtXlsDate(x.SapDate), 'Days Diff': x.DateDeltaDays,
+        })), fname);
+      } else if (unmatchedSection === 'manual') {
+        downloadXlsx(rows.map((x) => ({
+          'Vendor GST': x.VendorGST, 'Vendor Bill No': x.VendorBillNo,
+          'SAP SGST': x.SAP_SGST, 'SAP CGST': x.SAP_CGST, 'SAP IGST': x.SAP_IGST,
+          '2B GST (entered)': x.ExcelGST, '2B Bill (entered)': x.ExcelBill,
+          'Invoice Date': fmtXlsDate(x.InvoiceDate), 'Reconciled On': fmtXlsDate(x.ReconciledAt),
+        })), fname);
+      } else {
+        downloadXlsx(rows.map((x) => ({
+          'Vendor Code': x.CardCode, 'Vendor Name': x.CardName,
+          'GSTIN': x.GSTRegnNo || x.VendorGST, 'Bill No': x.NumAtCard,
+          'Date': fmtXlsDate(x.DocDate), 'Total': x.DocTotal,
+          'CGST': x.CGST, 'SGST': x.SGST, 'IGST': x.IGST, 'Tax': x.Tax, 'Reason': x.Reason,
+        })), fname);
+      }
+    } catch (e) { alert(`Error: ${e.message}`); } finally { setExporting(false); }
   };
 
   return (
@@ -333,16 +371,16 @@ export default function Dashboard() {
         )}
 
         {(tab === 'unmatched' || tab === 'matched') && (
-          loadingAll
-            ? <div className="text-center py-16 text-muted-foreground">Loading bills...</div>
-            : (
               <div className="animate-fade-in">
                 {/* Section toggle — only categories that actually have bills */}
                 <div className="flex flex-wrap items-center gap-2 mb-4">
+                  {loadingCounts && !SECTION_TABS.some((t) => t.count > 0) && (
+                    <span className="text-sm text-muted-foreground">Loading…</span>
+                  )}
                   {SECTION_TABS.filter((t) => t.count > 0).map((t) => (
                     <button
                       key={t.key}
-                      onClick={() => setUnmatchedSection(t.key)}
+                      onClick={() => loadSection(t.key, 1)}
                       className={`px-3.5 py-2 rounded-xl text-sm font-medium border transition-all ${
                         unmatchedSection === t.key
                           ? 'bg-primary text-primary-foreground border-primary shadow-sm'
@@ -372,27 +410,31 @@ export default function Dashboard() {
                   >
                     {[String(Number(filterYear) - 1), filterYear, String(Number(filterYear) + 1)].map((y) => <option key={y} value={y}>{y}</option>)}
                   </select>
+                  <div className="relative w-full sm:w-72">
+                    <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground w-4 h-4" />
+                    <input
+                      type="text"
+                      placeholder="Search vendor / GSTIN / bill no."
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      className="h-9 w-full rounded-xl border border-border bg-card pl-9 pr-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground shadow-sm"
+                    />
+                  </div>
                   <button
                     onClick={exportCurrent}
-                    className="ml-auto h-9 px-4 rounded-xl border border-primary/20 bg-primary/10 text-primary text-sm font-medium hover:bg-primary hover:text-white transition-colors"
+                    disabled={exporting}
+                    className="ml-auto h-9 px-4 rounded-xl border border-primary/20 bg-primary/10 text-primary text-sm font-medium hover:bg-primary hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    Export to Excel
+                    {exporting ? 'Exporting…' : 'Export to Excel'}
                   </button>
                 </div>
 
                 <p className="text-sm text-muted-foreground mb-4">{SECTION_DESC[unmatchedSection]}</p>
 
-                {joinedRows ? (
+                {loadingSection ? (
+                  <div className="text-center py-16 text-muted-foreground">Loading bills...</div>
+                ) : joinedRows ? (
                   <div>
-                    <div className="relative w-full sm:w-72 mb-4">
-                      <input
-                        type="text"
-                        placeholder="Search Vendor GST / Bill No."
-                        value={matchedSearch}
-                        onChange={(e) => setMatchedSearch(e.target.value)}
-                        className="h-10 w-full rounded-xl border border-border bg-card px-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all placeholder:text-muted-foreground shadow-sm"
-                      />
-                    </div>
                     <div className="overflow-x-auto rounded-2xl border border-border bg-card shadow-sm">
                       <div className="max-h-[600px] overflow-y-auto">
                         <table className="w-full text-sm text-left whitespace-nowrap">
@@ -417,21 +459,16 @@ export default function Dashboard() {
                           </thead>
                           <tbody>
                             {joinedRows
-                              .filter((r) => {
-                                const t = matchedSearch.trim().toLowerCase();
-                                if (!t) return true;
-                                return String(r.VendorGST || '').toLowerCase().includes(t)
-                                  || String(r.VendorBillNo || '').toLowerCase().includes(t);
-                              })
                               .map((r, i) => {
                                 const n = (v) => (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                                 const d = (x) => x ? new Date(x).toLocaleDateString('en-GB') : '—';
                                 const gstMismatch = r.SapGST && r.VendorGST && r.SapGST !== r.VendorGST;
                                 const valueBad = Math.abs(Number(r.TaxDelta) || 0) > 5;
                                 const dateBad = (r.DateDeltaDays || 0) > 10;
+                                const srNo = (sectionData.page - 1) * sectionData.pageSize + i + 1;
                                 return (
                                   <tr key={i} className={`border-b border-border/40 hover:bg-accent/30 transition-colors ${i % 2 ? 'bg-muted/5' : ''}`}>
-                                    <td className="px-4 py-2.5 text-muted-foreground">{i + 1}</td>
+                                    <td className="px-4 py-2.5 text-muted-foreground">{srNo}</td>
                                     <td className="px-4 py-2.5 font-medium text-foreground">{r.VendorGST || '—'}</td>
                                     <td className={`px-4 py-2.5 ${gstMismatch ? 'text-rose-600 font-medium' : 'text-foreground/80'}`}>{r.SapGST || '—'}</td>
                                     {joinedReconcilable && <td className="px-4 py-2.5 text-foreground/80">{r.Vendor2BName || '—'}</td>}
@@ -465,9 +502,10 @@ export default function Dashboard() {
                         </table>
                       </div>
                     </div>
-                    {joinedRows.length === 0 && (
+                    {sectionData.total === 0 && (
                       <div className="text-center py-12 text-muted-foreground">No bills in this category for this selection.</div>
                     )}
+                    {renderPager()}
                   </div>
                 ) : unmatchedSection === 'manual' ? (
                   <div>
@@ -489,11 +527,12 @@ export default function Dashboard() {
                             </tr>
                           </thead>
                           <tbody>
-                            {manualMatched.rows.map((r, i) => {
+                            {sectionData.rows.map((r, i) => {
                               const n = (v) => (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                              const srNo = (sectionData.page - 1) * sectionData.pageSize + i + 1;
                               return (
                                 <tr key={i} className={`border-b border-border/40 hover:bg-accent/30 transition-colors ${i % 2 ? 'bg-muted/5' : ''}`}>
-                                  <td className="px-4 py-2.5 text-muted-foreground">{i + 1}</td>
+                                  <td className="px-4 py-2.5 text-muted-foreground">{srNo}</td>
                                   <td className="px-4 py-2.5 font-medium text-foreground">{r.VendorGST || '—'}</td>
                                   <td className="px-4 py-2.5 text-foreground/90">{r.VendorBillNo || '—'}</td>
                                   <td className="px-4 py-2.5 text-right text-muted-foreground">{n(r.SAP_SGST)}</td>
@@ -510,23 +549,25 @@ export default function Dashboard() {
                         </table>
                       </div>
                     </div>
-                    {manualMatched.count === 0 && (
+                    {sectionData.total === 0 && (
                       <div className="text-center py-12 text-muted-foreground">No bills have been manually reconciled yet.</div>
                     )}
+                    {renderPager()}
                   </div>
                 ) : (
-                  <UnmatchedBills
-                    key={unmatchedSection}
-                    unmatchedBills={unmatchedSection === 'sap' ? sections.inSapNotIn2b
-                      : unmatchedSection === 'debit' ? sections.debitNotes
-                      : sections.in2bNotInSap}
-                    onReconcile={() => loadAllBills()}
-                    source="sap"
-                    readOnly={unmatchedSection === '2b'}
-                  />
+                  <div>
+                    <UnmatchedBills
+                      key={unmatchedSection}
+                      unmatchedBills={sectionData.rows}
+                      serverPaged
+                      onReconcile={() => { loadCounts(filterMonth, filterYear); loadSection(unmatchedSection, sectionData.page, filterMonth, filterYear); }}
+                      source="sap"
+                      readOnly={unmatchedSection === '2b'}
+                    />
+                    {renderPager()}
+                  </div>
                 )}
               </div>
-            )
         )}
       </main>
 
