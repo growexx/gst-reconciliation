@@ -21,6 +21,8 @@ router.get('/unmatched-sections', reconcile.fetchUnmatchedSections.bind(reconcil
 router.get('/matched-bills', reconcile.fetchMatchedBills.bind(reconcile));
 router.get('/tax-mismatch-bills', reconcile.fetchTaxMismatchBills.bind(reconcile));
 router.get('/manual-matched-bills', reconcile.fetchManualMatchedBills.bind(reconcile));
+router.get('/bill-counts', reconcile.fetchBillCounts.bind(reconcile));
+router.get('/bill-page', reconcile.fetchBillPage.bind(reconcile));
 router.post('/update-status', reconcile.updateBillStatus.bind(reconcile));
 
 module.exports = router;

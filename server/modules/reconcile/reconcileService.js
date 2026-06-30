@@ -520,28 +520,12 @@ class ReconcileService {
             }), { ordered: false });
         }
 
-        // 8. Sibling propagation — a still-undefined B2B doc adopts a resolved
-        //    sibling's vendor (same bill no, single GSTIN). Deterministic.
-        const resolved = await collections.apInvoices().find(
-            { companyId, vendorGstin: { $nin: ['', null] }, normalizedInvoiceNum: { $nin: ['', null] } },
-            { projection: { normalizedInvoiceNum: 1, vendorGstin: 1, vendorCode: 1, vendorName: 1 } },
-        ).toArray();
-        const sibByRef = new Map();
-        for (const r of resolved) {
-            const cur = sibByRef.get(r.normalizedInvoiceNum);
-            if (cur === undefined) sibByRef.set(r.normalizedInvoiceNum, r);
-            else if (cur !== 'AMBIG' && cur.vendorGstin !== r.vendorGstin) sibByRef.set(r.normalizedInvoiceNum, 'AMBIG');
-        }
-        const undefinedDocs = await collections.apInvoices().find(
-            { companyId, source: 'BKPF', docCategory: 'B2B', reconciled: { $ne: true }, $or: [{ vendorGstin: '' }, { vendorGstin: null }] },
-        ).toArray();
-        const propOps = [];
-        for (const inv of undefinedDocs) {
-            const sib = sibByRef.get(inv.normalizedInvoiceNum);
-            if (!sib || sib === 'AMBIG') continue;
-            propOps.push({ updateOne: { filter: { _id: inv._id }, update: { $set: { vendorGstin: sib.vendorGstin, vendorCode: sib.vendorCode || inv.vendorCode, vendorName: sib.vendorName || inv.vendorName, gstinSource: 'sibling' } } } });
-        }
-        if (propOps.length) await collections.apInvoices().bulkWrite(propOps, { ordered: false });
+        // 8. (Removed) Sibling propagation. A GSTIN-less bill stays GSTIN-less — we do
+        //    NOT borrow a vendor from another bill that merely shares an invoice-number
+        //    string. Matching alone decides a bill's vendor; if it didn't match, it
+        //    shows as unresolved rather than guessing (which spread one match's GSTIN
+        //    onto unrelated, different-amount bills). Any GSTIN a prior run propagated
+        //    this way is cleared by the step-4a reset on the next import.
 
         // 9. Re-apply durable manual reconciliations (survive ETL reloads).
         await this.applyManualReconciliations(companyId);
@@ -668,14 +652,14 @@ class ReconcileService {
         const byDoc = new Map();
         for (const inv of invs) byDoc.set(String(inv.docNo), inv);
 
-        // Month filter: keep a pair if EITHER its 2B date OR its SAP date is in the month.
+        // Month filter by the 2B invoice date (consistent with the paginated counts).
         // For near-miss buckets, drop any pair whose SAP bill has since been reconciled
         // (e.g. a manual reconcile from the table) so it leaves the bucket.
         const lines = all.filter((l) => {
             const inv = byDoc.get(String(l.matchedDocNo)) || {};
             if (opts.excludeReconciled && inv.reconciled === true) return false;
             if (opts.m0 == null) return true;
-            return inMonth(l.invoiceDate, opts.y, opts.m0) || inMonth(inv.docDate || inv.taxDate, opts.y, opts.m0);
+            return inMonth(l.invoiceDate, opts.y, opts.m0);
         });
 
         const rows = lines.map((l) => {
@@ -733,6 +717,179 @@ class ReconcileService {
         const win = fyWindow(m0 == null ? 'Apr' : month, year);
         const rows = await this._matchedRows(companyId, ['Match-DateDiff'], { win, m0, y });
         return { period: { month, year: String(year) }, matched: rows, count: rows.length };
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Pagination: a counts endpoint (small payload, drives the tab badges) and a
+    // per-category page endpoint (only the rows you're looking at are loaded).
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /** Date filter for a month, or the whole 2-FY window when month = 'All'. */
+    _periodDateRange(month, year) {
+        const m0 = monthIndex0(month); const y = Number(year);
+        if (m0 == null) { const w = fyWindow('Apr', year); return { $gte: w.start, $lt: w.end }; }
+        return { $gte: new Date(Date.UTC(y, m0, 1)), $lt: new Date(Date.UTC(y, m0 + 1, 1)) };
+    }
+
+    /** SAP vendor-master GSTIN → [names] (a GSTIN can map to several vendor codes). */
+    async _vendorMap(companyId) {
+        const rows = await collections.vendors()
+            .find({ companyId, vendorGstin: { $nin: ['', null] } }, { projection: { vendorGstin: 1, vendorName: 1 } }).toArray();
+        const map = new Map();
+        for (const v of rows) { const g = String(v.vendorGstin).toUpperCase(); if (!map.has(g)) map.set(g, []); map.get(g).push(v.vendorName || ''); }
+        return map;
+    }
+
+    /**
+     * SAP vendor-master GSTIN → { code, names } for resolving the vendor of a bill that
+     * carries a GSTIN but no name/code (e.g. a GSTIN adopted via sibling/2B backfill,
+     * which copies the number but not the vendor master's name). Used to label the
+     * "In SAP, not in 2B" rows instead of showing a blank / "undefined" vendor.
+     */
+    async _vendorByGstin(companyId) {
+        const rows = await collections.vendors()
+            .find({ companyId, vendorGstin: { $nin: ['', null] } }, { projection: { vendorGstin: 1, vendorName: 1, vendorCode: 1 } }).toArray();
+        const map = new Map();   // GSTIN -> { entries:[{code,name}], names:Set, codes:Set }
+        for (const v of rows) {
+            const g = String(v.vendorGstin).toUpperCase();
+            if (!map.has(g)) map.set(g, { entries: [], names: new Set(), codes: new Set() });
+            const e = map.get(g);
+            e.entries.push({ code: v.vendorCode || '', name: v.vendorName || '' });
+            if (v.vendorName) e.names.add(v.vendorName);
+            if (v.vendorCode) e.codes.add(v.vendorCode);
+        }
+        return map;
+    }
+
+    /** GET /bill-counts — counts for every category (no rows). */
+    async getBillCounts(companyId, month = 'Apr', year = '2026') {
+        const A = collections.apInvoices(), L = collections.lines();
+        const dr = this._periodDateRange(month, year);
+        const m0 = monthIndex0(month); const y = Number(year);
+        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const hasGst = { $expr: { $gt: [{ $add: [{ $ifNull: ['$tax', 0] }, { $ifNull: ['$cgst', 0] }, { $ifNull: ['$sgst', 0] }, { $ifNull: ['$igst', 0] }] }, 0] } };
+        const sapBase = { companyId, source: 'BKPF', cancelled: { $ne: true }, reconciled: { $ne: true }, pairCategory: { $in: [null] }, docDate: dr, ...hasGst };
+        const nm = { win, m0, y, excludeReconciled: true, vendorByGstin: await this._vendorMap(companyId) };
+
+        const [inSapNotIn2b, debitNotes, in2bNotInSap, cdnr2bNotInSap, matched, dateDiff,
+            gstDiff, valueDiff, vendorDiff, noBillNo, manual] = await Promise.all([
+            A.countDocuments({ ...sapBase, docCategory: 'B2B' }),
+            A.countDocuments({ ...sapBase, docCategory: 'CDNR' }),
+            L.countDocuments({ companyId, section: 'B2B', matchStatus: 'NEW', invoiceDate: dr }),
+            L.countDocuments({ companyId, section: 'CDNR', matchStatus: 'NEW', invoiceDate: dr }),
+            L.countDocuments({ companyId, matchStatus: 'Match', invoiceDate: dr }),
+            L.countDocuments({ companyId, matchStatus: 'Match-DateDiff', invoiceDate: dr }),
+            this._matchedRows(companyId, ['NotMatch-GstDiff'], nm).then((r) => r.length),
+            this._matchedRows(companyId, ['NotMatch-ValueDiff'], nm).then((r) => r.length),
+            this._matchedRows(companyId, ['NotMatch-VendorDiff'], nm).then((r) => r.length),
+            this._matchedRows(companyId, ['NotMatch-NoBillNo'], nm).then((r) => r.length),
+            this.getManuallyMatchedBills(companyId).then((r) => r.count),
+        ]);
+        return { period: { month, year: String(year) }, counts: {
+            inSapNotIn2b, in2bNotInSap, gstDiff, valueDiff, vendorDiff, noBillNo, debitNotes, cdnr2bNotInSap, matched, dateDiff, manual,
+        } };
+    }
+
+    /** Build the full DTO list for a SAP-side bucket ('sap' = B2B, 'debit' = CDNR). */
+    async _sapBucketRows(companyId, docCategory, dr) {
+        const hasGst = (i) => (Number(i.tax) || 0) + (Number(i.cgst) || 0) + (Number(i.sgst) || 0) + (Number(i.igst) || 0) > 0;
+        const invoices = await collections.apInvoices()
+            .find({ companyId, source: 'BKPF', docCategory, cancelled: { $ne: true }, reconciled: { $ne: true }, pairCategory: { $in: [null] }, docDate: dr }).toArray();
+        const lines = await collections.lines()
+            .find({ companyId, section: 'B2B' }, { projection: { supplierGstin: 1, normalizedInvoiceNum: 1, invoiceNum: 1 } }).toArray();
+        const portalIdx = buildPortalIndex(lines);
+
+        // A bill can carry a GSTIN (adopted via sibling/2B/RBKP) without a vendor name or
+        // code. Resolve those from the vendor master by GSTIN so the row shows a real
+        // vendor instead of a blank / "undefined".
+        const vbg = await this._vendorByGstin(companyId);
+        const resolveVendor = (dto) => {
+            const g = String(dto.GSTRegnNo || '').toUpperCase();
+            if (!g || (dto.CardName && dto.CardCode)) return dto;
+            const m = vbg.get(g);
+            if (!m) return dto;
+            if (!dto.CardName) {
+                // Prefer the name of the bill's OWN code; else the GSTIN's name(s). When a
+                // GSTIN has several vendor names, join them as a hint rather than guessing.
+                const byCode = dto.CardCode && m.entries.find((e) => e.code === dto.CardCode && e.name);
+                dto.CardName = byCode ? byCode.name : [...m.names].join(' / ');
+            }
+            // Only fill the code when the GSTIN maps to exactly one vendor code. If it maps
+            // to several (same GSTIN, multiple SAP vendor records), leave it blank so the
+            // row groups by GSTIN instead of being pinned to an arbitrary code.
+            if (!dto.CardCode && m.codes.size === 1) dto.CardCode = [...m.codes][0];
+            return dto;
+        };
+        return invoices.filter(hasGst).map((i) => resolveVendor(docCategory === 'CDNR'
+            ? toBillDTO(i, { category: 'debit_note_unmatched', reason: 'KG note not found in the 2B CDNR section' })
+            : toBillDTO(i, classifyUnmatched(i, portalIdx))));
+    }
+
+    /** Build the full DTO list for a 2B-side NEW bucket ('2b' = B2B, 'cdnr2b' = CDNR). */
+    async _twoBBucketRows(companyId, section, dr) {
+        const lines = await collections.lines().find({ companyId, section, matchStatus: 'NEW', invoiceDate: dr }).toArray();
+        if (section === 'CDNR') return lines.map((l) => to2bLineDTO(l, { category: 'cdnr_not_in_sap', reason: 'CDNR note not booked as a KG in SAP' }));
+        const invoices = await collections.apInvoices()
+            .find({ companyId, docCategory: 'B2B' }, { projection: { vendorGstin: 1, normalizedInvoiceNum: 1, vendorRef: 1 } }).toArray();
+        const sapIdx = buildSapIndex(invoices);
+        return lines.map((l) => to2bLineDTO(l, classify2bUnmatched(l, sapIdx)));
+    }
+
+    /** Group flat bill-DTOs by vendor and return one page of vendor groups (their bills, flat). */
+    _vendorPage(rows, page, pageSize) {
+        const groups = new Map();   // vendorKey -> bills[]
+        for (const r of rows) {
+            // Key by code, then GSTIN, then NAME — so a named-but-code/GSTIN-less bill
+            // groups by its own vendor name instead of all of them collapsing into one
+            // giant "—" card mislabelled by whichever named bill happened to be first.
+            const k = String(r.CardCode || r.VendorCode || r.GSTRegnNo || r.VendorGST || r.CardName || r.VendorName || '—');
+            if (!groups.has(k)) groups.set(k, []);
+            groups.get(k).push(r);
+        }
+        const keys = [...groups.keys()].sort();
+        const totalVendors = keys.length;
+        const pageKeys = keys.slice((page - 1) * pageSize, page * pageSize);
+        const pageRows = pageKeys.flatMap((k) => groups.get(k));
+        return { rows: pageRows, total: totalVendors, totalRows: rows.length, page, pageSize, groupBy: 'vendor' };
+    }
+
+    /**
+     * GET /bill-page — one page of one category. Vendor-grouped (a page of vendors)
+     * for the SAP/2B lists; row-paged for the matched / near-miss / manual tables.
+     */
+    async getBillPage(companyId, key, month = 'Apr', year = '2026', page = 1, pageSize = 25, search = '') {
+        page = Math.max(1, Number(page) || 1); pageSize = Math.max(1, Number(pageSize) || 25);
+        const dr = this._periodDateRange(month, year);
+        const m0 = monthIndex0(month); const y = Number(year);
+        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+
+        // Free-text search runs over the FULL bucket (every row, all vendors) before
+        // pagination, so a match is found even if it isn't on the current page.
+        const q = String(search || '').trim().toLowerCase();
+        const flt = (rows, fields) => (q ? rows.filter((r) => fields.some((f) => String(r[f] == null ? '' : r[f]).toLowerCase().includes(q))) : rows);
+        const SAP_FIELDS = ['CardCode', 'CardName', 'GSTRegnNo', 'VendorGST', 'NumAtCard', 'DocNum'];
+        const JOIN_FIELDS = ['VendorGST', 'SapGST', 'Vendor2BName', 'SapVendorName', 'VendorBillNo', 'SapBillNo'];
+        const MANUAL_FIELDS = ['VendorGST', 'VendorBillNo', 'ExcelGST', 'ExcelBill'];
+        const slice = (rows) => ({ rows: rows.slice((page - 1) * pageSize, page * pageSize), total: rows.length, page, pageSize, groupBy: 'row' });
+
+        // Vendor-grouped SAP/2B lists.
+        if (key === 'sap') return this._vendorPage(flt(await this._sapBucketRows(companyId, 'B2B', dr), SAP_FIELDS), page, pageSize);
+        if (key === 'debit') return this._vendorPage(flt(await this._sapBucketRows(companyId, 'CDNR', dr), SAP_FIELDS), page, pageSize);
+        if (key === '2b') return this._vendorPage(flt(await this._twoBBucketRows(companyId, 'B2B', dr), SAP_FIELDS), page, pageSize);
+        if (key === 'cdnr2b') return this._vendorPage(flt(await this._twoBBucketRows(companyId, 'CDNR', dr), SAP_FIELDS), page, pageSize);
+
+        // Manual (row-paged).
+        if (key === 'manual') return slice(flt((await this.getManuallyMatchedBills(companyId)).manual, MANUAL_FIELDS));
+
+        // Matched / near-miss joined tables (row-paged).
+        const statusByKey = { matched: 'Match', datediff: 'Match-DateDiff', gstdiff: 'NotMatch-GstDiff', valuediff: 'NotMatch-ValueDiff', vendordiff: 'NotMatch-VendorDiff', nobill: 'NotMatch-NoBillNo' };
+        const status = statusByKey[key];
+        if (status) {
+            const isNearMiss = key !== 'matched' && key !== 'datediff';
+            const rows = await this._matchedRows(companyId, [status], { win, m0, y, excludeReconciled: isNearMiss, vendorByGstin: await this._vendorMap(companyId) });
+            return slice(flt(rows, JOIN_FIELDS));
+        }
+        return { rows: [], total: 0, page, pageSize, groupBy: 'row' };
     }
 
     /**

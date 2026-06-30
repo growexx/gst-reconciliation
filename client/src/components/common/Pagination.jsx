@@ -29,7 +29,7 @@ export function Pagination({
                             onChange={(e) => onPageSizeChange(Number(e.target.value))}
                             className="bg-card border border-border rounded-lg text-foreground font-bold focus:outline-none focus:border-primary/50 transition-all cursor-pointer text-[10px] px-2 py-1"
                         >
-                            {[10, 25, 50, 100].map(size => (
+                            {[10, 15, 25, 50, 100].map(size => (
                                 <option key={size} value={size}>{size}</option>
                             ))}
                         </select>

@@ -119,6 +119,29 @@ class ReconcileController {
         }
     }
 
+    // Counts for every category (small payload, drives the tab badges).
+    async fetchBillCounts(req, res) {
+        try {
+            const month = req.query.month || 'Apr';
+            const year = req.query.year || '2026';
+            res.json(await reconcileService.getBillCounts(companyOf(req), month, year));
+        } catch (error) {
+            console.error('Error fetching bill counts:', error.message);
+            res.status(500).json({ error: 'Failed to fetch bill counts' });
+        }
+    }
+
+    // One page of one category (vendor-grouped for SAP/2B lists, row-paged otherwise).
+    async fetchBillPage(req, res) {
+        try {
+            const { key, month = 'Apr', year = '2026', page = 1, pageSize = 25, q = '' } = req.query;
+            res.json(await reconcileService.getBillPage(companyOf(req), key, month, year, Number(page), Number(pageSize), q));
+        } catch (error) {
+            console.error('Error fetching bill page:', error.message);
+            res.status(500).json({ error: 'Failed to fetch bill page' });
+        }
+    }
+
     async updateBillStatus(req, res) {
         try {
             const companyId = companyOf(req);

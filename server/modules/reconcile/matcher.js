@@ -42,12 +42,21 @@ const nameCore = (s) => {
     return x;
 };
 const nameSigTokens = (s) => String(s || '').toUpperCase().split(/[^A-Z0-9]+/).filter((t) => t.length >= 4 && !NAME_GENERIC.includes(t));
+// STRICT: true only when both names are present and genuinely the SAME vendor —
+// equal cores, one core contained in the other (handles "M/s", corporate suffixes),
+// or EVERY significant token of the shorter name appears in the other (handles word
+// reordering, e.g. "LINK INTIME" vs "INTIME LINK"). Sharing a single common word
+// ("AMIT CONES" vs "AMIT COTTON") is NOT enough. No name on either side ⇒ cannot
+// confirm ⇒ false (vendor identity is required, not assumed).
 function vendorNamesAgree(a, b) {
-    if (!a || !b) return true;                                  // nothing to compare → don't block
     const ca = nameCore(a); const cb = nameCore(b);
-    if (ca && cb && (ca === cb || ca.includes(cb) || cb.includes(ca))) return true;
-    const ta = new Set(nameSigTokens(a)); const tb = nameSigTokens(b);
-    return tb.some((t) => ta.has(t));                           // share a significant brand word
+    if (!ca || !cb) return false;                               // can't confirm without both names
+    if (ca === cb || ca.includes(cb) || cb.includes(ca)) return true;
+    const ta = new Set(nameSigTokens(a)); const tb = new Set(nameSigTokens(b));
+    if (!ta.size || !tb.size) return false;
+    const [small, big] = ta.size <= tb.size ? [ta, tb] : [tb, ta];
+    for (const t of small) if (!big.has(t)) return false;       // every token of the shorter must be present
+    return true;
 }
 
 function toDate(v) {
@@ -162,26 +171,25 @@ function reconcile(lines, invoices, opts = {}) {
     const gstinDiff   = (l, i) => !gstinAbsent(i) && !!lineG(l) && lineG(l) !== invG(i);
     const billEq      = (l, i) => !!normRef(l) && normRef(l) === normInvRef(i);
 
-    // ── Vendor checks for a GSTIN-less SAP bill that would adopt the 2B GSTIN ──
-    // SAP's OWN identity for the bill = its RBKP-reserve vendor (or BSEG name).
+    // ── Vendor identity is PRIMARY. A bill matches a 2B line only when the GSTIN is
+    //    equal OR the vendor is POSITIVELY confirmed by name — NEVER on bill-no +
+    //    amount + date alone. If we cannot confirm the vendor, the bill stays unmatched. ──
     const hasOwnVendor = (i) => !!(i.rbkpGstin || i.vendorName);
-    const ownVendorAgrees = (l, i) => {
-        if (i.rbkpGstin && String(i.rbkpGstin).toUpperCase() === lineG(l)) return true; // reserve confirms same GSTIN
-        return vendorNamesAgree(i.rbkpVendorName || i.vendorName, l.supplierName);
+    // SAP's own identity for a GSTIN-less bill: RBKP-reserve GSTIN (must equal the 2B
+    // GSTIN), else the SAP/BSEG vendor name (must agree with the 2B supplier name).
+    const ownVendorConfirms = (l, i) => {
+        if (i.rbkpGstin) return String(i.rbkpGstin).toUpperCase() === lineG(l);
+        return vendorNamesAgree(i.vendorName, l.supplierName);
     };
-    // Look the 2B GSTIN up in SAP's vendor master; does its registered name match the 2B?
+    // The 2B GSTIN looked up in SAP's vendor master (a GSTIN can map to several codes).
     const vendorByGstin = opts.vendorByGstin || null;
-    const masterAgrees = (l, i) => {
-        if (!vendorByGstin) return true;
-        const names = vendorByGstin.get(lineG(l));     // a GSTIN can map to several SAP vendor codes
-        if (!names || !names.length) return true;      // 2B GSTIN not in SAP master → can't disprove
-        return names.some((nm) => vendorNamesAgree(nm, l.supplierName));   // ANY SAP vendor for it agrees
-    };
-    // A GSTIN-less bill matches only if SAP's vendor for it agrees with the 2B:
-    //  - if SAP has its own vendor for the bill → that must agree (else it's a different
-    //    vendor's invoice; the bill simply isn't this 2B line → stays unmatched);
-    //  - else fall back to the vendor-master name for the 2B GSTIN.
-    const vendorVerified = (l, i) => hasOwnVendor(i) ? ownVendorAgrees(l, i) : masterAgrees(l, i);
+    const masterNames = (l) => (vendorByGstin ? (vendorByGstin.get(lineG(l)) || []) : []);
+    const masterConfirms = (l) => masterNames(l).some((nm) => vendorNamesAgree(nm, l.supplierName));
+    const masterContradicts = (l) => { const n = masterNames(l); return n.length > 0 && !n.some((nm) => vendorNamesAgree(nm, l.supplierName)); };
+    // Positive vendor confirmation for a GSTIN-less bill: its own vendor agrees, or the
+    // 2B GSTIN resolves in SAP's master to an agreeing name. Not-in-master ⇒ unconfirmed
+    // ⇒ no match (left for review), NOT an optimistic auto-accept.
+    const vendorVerified = (l, i) => hasOwnVendor(i) ? ownVendorConfirms(l, i) : masterConfirms(l);
     const vendorOk    = (l, i) => gstinEq(l, i) || (gstinAbsent(i) && vendorVerified(l, i));
 
     function buildMatch(line, inv, category) {
@@ -240,7 +248,7 @@ function reconcile(lines, invoices, opts = {}) {
     }
     // Diff-Vendor-Name (clause 2): GSTIN-less bill with NO own SAP vendor, where the 2B
     // GSTIN looked up in SAP's vendor master resolves to a DIFFERENT supplier name.
-    pass((l, i) => billEq(l, i) && valueOk(l, i) && gstinAbsent(i) && !hasOwnVendor(i) && !masterAgrees(l, i), CATEGORY.VENDOR_DIFF, 'ref');
+    pass((l, i) => billEq(l, i) && valueOk(l, i) && gstinAbsent(i) && !hasOwnVendor(i) && masterContradicts(l), CATEGORY.VENDOR_DIFF, 'ref');
     // Value-Diff requires the SAME GSTIN — else a shared bill number across two
     // different vendors would falsely pair. (Safe in the fallback pass: gstinEq guards it.)
     pass((l, i) => billEq(l, i) && gstinEq(l, i) && !valueOk(l, i),                  CATEGORY.VALUE_DIFF, 'ref');
