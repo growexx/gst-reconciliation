@@ -13,6 +13,16 @@ function sessionOf(req) {
     return req.headers.authorization?.split(' ')[1];
 }
 
+// Record a job's terminal (done) state, then evict it after a grace period so the
+// in-memory progress Map can't grow one dangling entry per completed job. The client
+// has polled the final result long before the timer fires. unref() so a pending
+// eviction never keeps the process alive.
+function settleProgress(sessionId, payload) {
+    progressStore.set(sessionId, { ...payload, done: true });
+    const t = setTimeout(() => progressStore.delete(sessionId), 60000);
+    if (typeof t.unref === 'function') t.unref();
+}
+
 class ReconcileController {
     async processFile(req, res) {
         try {
@@ -36,11 +46,11 @@ class ReconcileController {
             };
             reconcileService.importPortalFile(buf, companyId, month, year, sessionId, report)
                 .then(({ result, unmatchedBills }) => {
-                    progressStore.set(sessionId, { phase: 'Done', done: true, result, unmatchedBills });
+                    settleProgress(sessionId, { phase: 'Done', result, unmatchedBills });
                 })
                 .catch((error) => {
                     console.error('Reconciliation error:', error.message);
-                    progressStore.set(sessionId, { phase: 'Error', done: true, error: error.message || 'Reconciliation failed' });
+                    settleProgress(sessionId, { phase: 'Error', error: error.message || 'Reconciliation failed' });
                 });
 
             return res.status(202).json({ running: true });
@@ -67,10 +77,10 @@ class ReconcileController {
                 progressStore.set(sessionId, { ...prev, ...(p && typeof p === 'object' ? p : {}), done: false });
             };
             reconcileService.refreshPeriod(companyId, month, year, report)
-                .then(({ result, unmatchedBills }) => { progressStore.set(sessionId, { phase: 'Done', done: true, result, unmatchedBills }); })
+                .then(({ result, unmatchedBills }) => { settleProgress(sessionId, { phase: 'Done', result, unmatchedBills }); })
                 .catch((error) => {
                     console.error('Refresh error:', error.message);
-                    progressStore.set(sessionId, { phase: 'Error', done: true, error: error.message || 'Refresh failed' });
+                    settleProgress(sessionId, { phase: 'Error', error: error.message || 'Refresh failed' });
                 });
             return res.status(202).json({ running: true });
         } catch (error) {

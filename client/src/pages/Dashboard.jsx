@@ -316,12 +316,14 @@ export default function Dashboard() {
       const start = await fetch(`/api/reconcile/refresh?month=${encodeURIComponent(filterMonth)}&year=${encodeURIComponent(filterYear)}`, { method: 'POST', headers: authHeaders() });
       if (!start.ok) { const d = await start.json().catch(() => ({})); throw new Error(d.error || 'Failed to start refresh'); }
       const done = await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 10 * 60 * 1000;   // give up after 10 min
         const poll = async () => {
           try {
             const r = await fetch('/api/reconcile/progress', { headers: authHeaders() });
             if (r.ok) { const p = await r.json(); if (p && p.done) { if (p.error) return reject(new Error(p.error)); return resolve(p); } }
           } catch { /* transient — keep polling */ }
-          setTimeout(poll, 2000);
+          if (Date.now() < deadline) setTimeout(poll, 2000);
+          else reject(new Error('Timed out waiting for refresh — it may still be running; reload to check.'));
         };
         poll();
       });

@@ -28,15 +28,19 @@ const WINDOW_DAYS = Number(process.env.SAP_API_WINDOW_DAYS) || 3;  // date-slice
 const CONCURRENCY = Number(process.env.SAP_API_CONCURRENCY) || 12;
 const TIMEOUT_MS = Number(process.env.SAP_API_TIMEOUT_MS) || 20000;   // fail fast on a stall, then retry
 const RETRIES = Number(process.env.SAP_API_RETRIES) || 5;
-const INSECURE_TLS = process.env.SAP_API_INSECURE_TLS !== 'false';
+// Fail-CLOSED: TLS verification is ON unless SAP_API_INSECURE_TLS=true is set explicitly.
+// A missing/typo'd value keeps verification on rather than silently trusting any cert.
+const INSECURE_TLS = process.env.SAP_API_INSECURE_TLS === 'true';
 // BSEG is the heaviest table; RE (MM) vendors come from RBKP, so BSEG is fetched only
 // for KR/KG by default. SAP_API_BSEG_ALL=true fetches BSEG for every AP doc (ETL parity).
 const BSEG_ALL = process.env.SAP_API_BSEG_ALL === 'true';
 // Auth: single shared SERVICE account (maintained in an SAP custom table). We log in
 // once, cache the Bearer token server-side, and refresh before SAP's ~2h expiry. This is
 // backend-only — it is NOT the app's user login and never reaches the browser.
-const SAP_USER = process.env.SAP_API_USER || 'Admin';
-const SAP_PASSWORD = process.env.SAP_API_PASSWORD || 'admin123';
+// No hardcoded fallback — creds MUST come from the environment. login() fails loudly
+// (and the caller degrades to stored data) if they are missing.
+const SAP_USER = process.env.SAP_API_USER || '';
+const SAP_PASSWORD = process.env.SAP_API_PASSWORD || '';
 const TOKEN_TTL_MS = Number(process.env.SAP_API_TOKEN_TTL_MS) || 110 * 60 * 1000;   // refresh ~10 min before the 2h expiry
 
 const agent = new https.Agent({ keepAlive: true, maxSockets: CONCURRENCY + 4, rejectUnauthorized: !INSECURE_TLS });
@@ -44,19 +48,6 @@ const agent = new https.Agent({ keepAlive: true, maxSockets: CONCURRENCY + 4, re
 const CUSTOMS_RE = /custom|bill of entry|\bBE\b|IGST ON CUSTOM/i;
 
 const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
-
-// Split [from,to] (YYYYMMDD) into <=days-long slices (YYYYMMDD pairs).
-function dateSlices(from, to, days) {
-    const parse = (s) => new Date(Date.UTC(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8)));
-    const fmt = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-    const end = parse(to); const out = []; let cur = parse(from);
-    while (cur <= end) {
-        const se = new Date(cur); se.setUTCDate(se.getUTCDate() + days - 1);
-        out.push([fmt(cur), fmt(se > end ? end : se)]);
-        cur = new Date(se); cur.setUTCDate(cur.getUTCDate() + 1);
-    }
-    return out;
-}
 
 // Indian fiscal year (GJAHR) for a YYYYMMDD date: Apr–Mar, so Jan–Mar belong to the
 // previous year. Lets the ±1-month window span a fiscal boundary correctly.
@@ -129,6 +120,9 @@ let _token = null, _tokenAt = 0, _loginInFlight = null;
 
 function login() {
     return new Promise((resolve, reject) => {
+        if (!SAP_USER || !SAP_PASSWORD) {
+            return reject(new Error('SAP API credentials not configured — set SAP_API_USER and SAP_API_PASSWORD.'));
+        }
         const body = JSON.stringify({ user: SAP_USER, password: SAP_PASSWORD });
         const req = https.request(new URL(`${BASE_URL}/login`), {
             method: 'POST', agent,
@@ -232,16 +226,17 @@ async function fetchWindow({ from, to, onProgress } = {}) {
     for (const [fy, set] of apByFy) for (const c of chunk([...set], CHUNK)) tasks.push({ kind: 'bset', run: () => getJson('bset', { document: c, fiscal: fy }, KEYS.bset) });
     for (const [fy, set] of bsegByFy) for (const c of chunk([...set], CHUNK)) tasks.push({ kind: 'bseg', run: () => getJson('bseg', { document: c, fiscal: fy }, KEYS.bseg) });
     for (const s of segs) tasks.push({ kind: 'rbkp', run: () => getJson('rbkp', { rbkp_from: s.f, rbkp_to: s.t, fiscal: s.fiscal }, KEYS.rbkp) });
+    // SA (imports): only BSEG is needed (Bill-of-Entry text + import-IGST GL line).
+    // SA BSET is never consumed by buildImpgInvoices, so we don't fetch it.
     for (const [fy, set] of saByFy) for (const c of chunk([...set], CHUNK)) {
         tasks.push({ kind: 'saBseg', run: () => getJson('bseg', { document: c, fiscal: fy }, KEYS.bseg) });
-        tasks.push({ kind: 'saBset', run: () => getJson('bset', { document: c, fiscal: fy }, KEYS.bset) });
     }
     log(`Fetching details: ${tasks.length} calls (BSET ${sz(apByFy)} docs, BSEG ${sz(bsegByFy)} docs, RBKP ${segs.length})…`);
     const detail = await pool(tasks, CONCURRENCY, async (task) => ({ kind: task.kind, rows: (await task.run()) || [] }));
     failed += detail.filter((x) => x == null).length; total += detail.length;
     const by = (k) => detail.filter((d) => d && d.kind === k).flatMap((d) => d.rows);
     const bset = by('bset'), bseg = by('bseg'), rbkp = by('rbkp');
-    const saImport = { bkpf: saImportRows, bseg: by('saBseg'), bset: by('saBset') };
+    const saImport = { bkpf: saImportRows, bseg: by('saBseg') };
 
     // Phase C — LFA1 for the distinct vendor codes discovered.
     const vendorCodes = [...new Set([...bseg.map((r) => r['Supplier']), ...rbkp.map((r) => r['Invoicing Party'])]
@@ -255,4 +250,4 @@ async function fetchWindow({ from, to, onProgress } = {}) {
     return { bkpf: apRows, bseg, bset, rbkp, lfa1, saImport, failed, total };
 }
 
-module.exports = { fetchWindow, getJson, buildUrl, dateSlices, BASE_URL, CLIENT, KEYS };
+module.exports = { fetchWindow, getJson, buildUrl, BASE_URL, CLIENT, KEYS };

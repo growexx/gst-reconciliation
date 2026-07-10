@@ -395,20 +395,6 @@ function inMonth(d, year, m0) {
     return x.getUTCFullYear() === Number(year) && x.getUTCMonth() === m0;
 }
 
-// SAP fetch window for a reconcile month, widened by ±SAP_FETCH_MONTHS (default 1) so a
-// bill posted in an adjacent month is still pulled (a bill can post on a different date
-// than its invoice). The client derives the SAP fiscal year (GJAHR) per date-slice, so
-// the window may cross a fiscal boundary (e.g. Mar↔Apr) safely.
-function sapFetchWindow(month, year) {
-    const m0 = monthIndex0(month); const y = Number(year);
-    const pad = Number(process.env.SAP_FETCH_MONTHS || 2);   // ±2 months — catches bills posted a month or two off the invoice date
-    const fmt = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-    return {
-        from: fmt(new Date(Date.UTC(y, m0 - pad, 1))),
-        to: fmt(new Date(Date.UTC(y, m0 + pad + 1, 0))),
-    };
-}
-
 // Fetch window = the WHOLE Indian financial year(s) (Apr–Mar) that the uploaded 2B's
 // invoice dates fall in, plus a short tail (SAP_FETCH_MONTHS) past FY-end for bills posted
 // early in the next year. A monthly 2B → that month's full FY; a full-FY "All periods" 2B →
@@ -473,7 +459,7 @@ class ReconcileService {
      */
     async syncSapWindow(companyId, win, onProgress) {
         const tables = await fetchWindow({ ...win, onProgress });
-        const { invoices, vendorMaster } = buildInvoices(tables, companyId);
+        const { invoices, vendorMaster, reversedKeys } = buildInvoices(tables, companyId);
 
         const invOps = invoices.filter((i) => i.docNo).map((i) => ({
             updateOne: {
@@ -498,7 +484,32 @@ class ReconcileService {
         if (venOps.length) for (let k = 0; k < venOps.length; k += 1000) {
             await collections.vendors().bulkWrite(venOps.slice(k, k + 1000), { ordered: false });
         }
-        return { invoices: invoices.length, vendors: venOps.length, window: win, failed: tables.failed || 0, total: tables.total || 0 };
+
+        // Reversal cleanup: a doc SAP now flags as reversed is dropped from `invoices`, but
+        // a copy from an EARLIER fetch may still sit in ap_invoices and keep matching. Mark
+        // those `cancelled` (the candidate query filters cancelled≠true) and drop any auto/
+        // manual reconciliation on them — a reversed bill must not stay matched. The audit
+        // trail in recon_log is untouched. GUARD: only when the fetch fully succeeded, so a
+        // transient failure (some calls dropped) can never mistake a not-fetched doc for a
+        // reversed one and wrongly cancel a live bill.
+        let cancelledReversed = 0;
+        if ((tables.failed || 0) === 0 && reversedKeys && reversedKeys.size) {
+            const revOps = [...reversedKeys].map((k) => {
+                const p = k.lastIndexOf('|');
+                return { updateOne: {
+                    filter: { companyId, docNo: k.slice(0, p), fiscalYear: k.slice(p + 1) },
+                    update: {
+                        $set: { cancelled: true, reconciled: false },
+                        $unset: { reconciledAuto: '', reconciledAt: '', reconciledPeriodId: '', reconciledCategory: '', reconciledReason: '', reconciledStage: '', reconciledTaxDelta: '', reconciledFlag: '', reconciledTier: '' },
+                    },
+                } };
+            });
+            for (let k = 0; k < revOps.length; k += 1000) {
+                const res = await collections.apInvoices().bulkWrite(revOps.slice(k, k + 1000), { ordered: false });
+                cancelledReversed += res.modifiedCount || 0;
+            }
+        }
+        return { invoices: invoices.length, vendors: venOps.length, window: win, failed: tables.failed || 0, total: tables.total || 0, cancelledReversed };
     }
 
     /**
@@ -595,7 +606,7 @@ class ReconcileService {
                     console.log('  [SAP]', m);
                     if (onProgress) onProgress({ phase: `SAP: ${m}` });
                 });
-                console.log(`  SAP on-demand fetch: upserted ${r.invoices} invoices for ${r.window.from}–${r.window.to} (${r.failed || 0}/${r.total || 0} calls failed)`);
+                console.log(`  SAP on-demand fetch: upserted ${r.invoices} invoices for ${r.window.from}–${r.window.to} (${r.failed || 0}/${r.total || 0} calls failed, ${r.cancelledReversed || 0} reversed cancelled)`);
                 if (r.failed) fetchWarning = `SAP data may be incomplete — ${r.failed} of ${r.total} fetch calls failed. Some bills may show as unmatched; re-run to be sure.`;
             } catch (e) {
                 console.error('  SAP on-demand fetch FAILED (continuing with stored data):', e.message);

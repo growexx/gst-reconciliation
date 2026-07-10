@@ -219,6 +219,7 @@ const normBoe = (s) => String(s == null ? '' : s).replace(/\D/g, '').replace(/^0
 
 function buildImpgInvoices(saImport, companyId) {
     const igstGl = process.env.SAP_IMPG_IGST_GL || '0000170025';
+    const igstGlN = Number(igstGl);   // compare numerically → robust to zero-padding (0000170025 vs 170025)
     const out = [];
     const bsegByDoc = new Map();
     for (const r of (saImport.bseg || [])) {
@@ -230,7 +231,7 @@ function buildImpgInvoices(saImport, companyId) {
         let boe = '';
         for (const l of lines) { const m = String(l['Text'] || '').match(BOE_RE); if (m) { boe = normBoe(m[1]); break; } }
         if (!boe) continue;                                  // no Bill-of-Entry → not an import doc
-        const igst = +lines.filter((l) => String(l['hkont'] || l['G/L Account'] || '') === igstGl)
+        const igst = +lines.filter((l) => Number(l['hkont'] || l['G/L Account'] || 0) === igstGlN)
             .reduce((s, l) => s + Math.abs(num(l['Amount'])), 0).toFixed(2);
         const docDate = toDate(h['Document Date']);
         out.push({
@@ -246,11 +247,34 @@ function buildImpgInvoices(saImport, companyId) {
     return out;
 }
 
+// Keys (docNo|fiscalYear, in the SAME form stored on ap_invoices) of docs SAP now flags
+// as reversed. These are already excluded from the invoice list; syncSapWindow uses this
+// set to cancel any copy an earlier fetch left in ap_invoices, so a bill reversed after it
+// was first loaded stops being a match candidate. Mirrors the skip logic in
+// buildBkpfInvoices / buildRbkpOnlyInvoices exactly.
+function collectReversedKeys(bkpf, rbkp) {
+    const keys = new Set();
+    const B = F.bkpf, R = F.rbkp;
+    for (const r of bkpf) {
+        if (!VENDOR_TYPES.has(B.type(r))) continue;
+        const rev = B.reversal(r);
+        if (rev != null && String(rev).trim() !== '') keys.add(`${String(B.doc(r))}|${String(B.year(r))}`);
+    }
+    const reverser = new Set(rbkp.map((r) => R.rvrsd(r)).filter((v) => v != null && v !== '').map(String));
+    for (const r of rbkp) {
+        if (R.type(r) !== 'RE') continue;
+        const doc = String(R.doc(r));
+        const rv = R.rvrsd(r);
+        if ((rv != null && rv !== '') || reverser.has(doc)) keys.add(`RBKP:${doc}|${String(R.year(r))}`);
+    }
+    return keys;
+}
+
 /**
  * Build the full ap_invoices list from raw API tables.
  * @param {Object} tables { bkpf, bseg, bset, rbkp, lfa1, saImport } arrays of raw API rows
  * @param {string} companyId
- * @returns {{ invoices, vendorMaster, stat }}
+ * @returns {{ invoices, vendorMaster, stat, reversedKeys }}
  */
 function buildInvoices(tables, companyId) {
     const { bkpf = [], bseg = [], bset = [], rbkp = [], lfa1 = [], saImport = {} } = tables;
@@ -266,6 +290,7 @@ function buildInvoices(tables, companyId) {
 
     return {
         invoices: bkpfInv.concat(rbkpOnly, impg), vendorMaster,
+        reversedKeys: collectReversedKeys(bkpf, rbkp),
         stat: { ...stat, rbkpOnly: rbkpOnly.length, impg: impg.length },
     };
 }

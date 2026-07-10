@@ -180,6 +180,7 @@ const FileUpload = ({
 
       // Stage 4: poll until the background job reports done (or error).
       const data = await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 10 * 60 * 1000;   // give up after 10 min
         const poll = async () => {
           try {
             const res = await fetch('/api/reconcile/progress', { headers: authHeaders });
@@ -198,7 +199,8 @@ const FileUpload = ({
               }
             }
           } catch (err) { /* transient network error — keep polling */ }
-          setTimeout(poll, 2000);
+          if (Date.now() < deadline) setTimeout(poll, 2000);
+          else reject(new Error('Timed out waiting for reconciliation — it may still be running; reload to check.'));
         };
         poll();
       });
