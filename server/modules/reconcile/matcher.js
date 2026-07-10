@@ -235,6 +235,15 @@ function reconcile(lines, invoices, opts = {}) {
         }
     }
 
+    // CDNR / credit-debit notes (opts.noteMode): match on GSTIN + tax(±5) + date(±10)
+    // ONLY — the note number is ignored (SAP's KG reference rarely equals the supplier's
+    // 2B note no). Uses |tax| via absTax for signed credit memos.
+    if (opts.noteMode) {
+        pass((l, i) => gstinEq(l, i) && valueOk(l, i) && dateOk(l, i),  CATEGORY.MATCH,     'gstin');
+        pass((l, i) => gstinEq(l, i) && valueOk(l, i) && !dateOk(l, i), CATEGORY.DATE_DIFF, 'gstin');
+        return { matches };
+    }
+
     // Real matches always run.
     pass((l, i) => billEq(l, i) && valueOk(l, i) && vendorOk(l, i) && dateOk(l, i),  CATEGORY.MATCH,      'ref');
     pass((l, i) => billEq(l, i) && valueOk(l, i) && vendorOk(l, i) && !dateOk(l, i), CATEGORY.DATE_DIFF,  'ref');
@@ -258,8 +267,41 @@ function reconcile(lines, invoices, opts = {}) {
     return { matches };
 }
 
+/**
+ * IMPG (imports): match 2B IMPG lines to SAP customs docs on normalized Bill-of-Entry
+ * number AND IGST value (±tol). BoE alone is unreliable (SAP 7-digit vs portal 5-digit),
+ * so the IGST value must also agree. Each side used at most once.
+ */
+function matchImpg(lines, invoices, tol = AMOUNT_TOLERANCE) {
+    const byBoe = new Map();
+    for (const inv of invoices) {
+        const b = inv.boe || inv.normalizedInvoiceNum; if (!b) continue;
+        if (!byBoe.has(b)) byBoe.set(b, []); byBoe.get(b).push(inv);
+    }
+    const igstOf = (x) => Number(x.igst != null ? x.igst : x.tax) || 0;
+    const usedInv = new Set(); const matches = [];
+    for (const line of lines) {
+        const b = line.boe || line.normalizedInvoiceNum; if (!b) continue;
+        const cands = (byBoe.get(b) || []).filter((i) => !usedInv.has(`${i.docNo}|${i.fiscalYear}`));
+        let best = null, bd = Infinity;
+        for (const inv of cands) {
+            const d = Math.abs(igstOf(inv) - igstOf(line));
+            if (d <= tol && d < bd) { bd = d; best = inv; }
+        }
+        if (best) {
+            usedInv.add(`${best.docNo}|${best.fiscalYear}`);
+            matches.push({
+                lineId: line._id, invoiceDocNo: best.docNo, invoiceFiscalYear: best.fiscalYear,
+                category: CATEGORY.MATCH, status: CATEGORY.MATCH, reason: 'IMPG: Bill-of-Entry + IGST',
+                taxDelta: +(igstOf(best) - igstOf(line)).toFixed(2), dateDelta: null,
+            });
+        }
+    }
+    return { matches };
+}
+
 module.exports = {
-    normalizeInvoiceNum, isMatch, reconcile,
+    normalizeInvoiceNum, isMatch, reconcile, matchImpg,
     invoiceTax, lineTax,
     CATEGORY, REASONS, MATCHED_CATEGORIES,
     AMOUNT_TOLERANCE, DATE_WINDOW_DAYS,

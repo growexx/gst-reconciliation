@@ -9,6 +9,7 @@ import FileUpload from '../components/FileUpload';
 import UnmatchedBills from '../components/UnmatchedBills';
 import ExcelPreview from '../components/ExcelPreview';
 import Pagination from '../components/common/Pagination';
+import { monthsForYear, yearOptions } from '../lib/fy';
 
 const endpoints = {
   reconcile: '/api/reconcile/upload',
@@ -22,8 +23,9 @@ const TABS = [
 ];
 
 // Valid sub-section keys per tab — used to validate/restore the ?section= query param.
-const UNMATCHED_KEYS = ['sap', '2b', 'gstdiff', 'valuediff', 'vendordiff', 'nobill', 'debit'];
-const MATCHED_KEYS = ['matched', 'datediff', 'manual'];
+const UNMATCHED_KEYS = ['sap', '2b', 'gstdiff', 'valuediff', 'vendordiff', 'nobill', 'debit', 'impgsap', 'impg2b'];
+const MATCHED_KEYS = ['matched', 'datediff', 'manual', 'impgmatched'];
+const IMPG_KEYS = ['impgsap', 'impg2b', 'impgmatched'];
 
 // Default rows/page per top-level tab (user can still change it via the Pagination control).
 const defaultPageSize = (t) => (t === 'matched' ? 15 : 10);
@@ -197,7 +199,25 @@ export default function Dashboard() {
   // On first load (e.g. a refresh on ?tab=unmatched), fetch the bills for that tab so
   // we stay put instead of falling back to an empty Reconcile view.
   useEffect(() => {
-    if (qsTab === 'unmatched' || qsTab === 'matched') { loadCounts(filterMonth, filterYear); loadSection(qsSection, 1, filterMonth, filterYear, search, defaultPageSize(qsTab)); }
+    const onBills = qsTab === 'unmatched' || qsTab === 'matched';
+    const size = defaultPageSize(qsTab);
+    // If the URL pins a period (shared link / refresh), honour it. Otherwise seed the
+    // view to the latest reconciled month/year (most recent period with data) — done on
+    // any tab so that arriving at Unmatched/Matched later already shows that period.
+    const pinned = searchParams.get('month') && searchParams.get('year');
+    if (pinned) {
+      if (onBills) { loadCounts(filterMonth, filterYear); loadSection(qsSection, 1, filterMonth, filterYear, search, size); }
+      return;
+    }
+    (async () => {
+      let m = filterMonth, y = filterYear;
+      try {
+        const r = await fetch('/api/reconcile/periods', { headers: authHeaders() });
+        const d = await r.json();
+        if (r.ok && d.latest) { m = d.latest.month; y = String(d.latest.year); setFilterMonth(m); setFilterYear(y); }
+      } catch { /* no periods yet → keep defaults */ }
+      if (onBills) { loadCounts(m, y); loadSection(qsSection, 1, m, y, search, size); }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -220,11 +240,14 @@ export default function Dashboard() {
     { key: 'vendordiff', label: 'Not Matched — Diff Vendor Name', count: counts.vendorDiff || 0 },
     { key: 'nobill', label: 'Not Matched — Diff Bill No', count: counts.noBillNo || 0 },
     { key: 'debit', label: 'Not Matched — Debit Note', count: counts.debitNotes || 0 },
+    { key: 'impgsap', label: 'IMPG — in SAP, not in 2B', count: counts.impgSap || 0 },
+    { key: 'impg2b', label: 'IMPG — in 2B, not in SAP', count: counts.impg2b || 0 },
   ];
   const MATCHED_SECTIONS = [
     { key: 'matched', label: 'Matched', count: counts.matched || 0 },
     { key: 'datediff', label: 'Matched — Date diff', count: counts.dateDiff || 0 },
     { key: 'manual', label: 'Manually matched', count: counts.manual || 0 },
+    { key: 'impgmatched', label: 'IMPG — Matched', count: counts.impgMatched || 0 },
   ];
   const SECTION_TABS = tab === 'matched' ? MATCHED_SECTIONS : UNMATCHED_SECTIONS;
 
@@ -238,11 +261,15 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [counts, tab]);
 
-  // Financial-year months (Apr→Mar) for the month filter; '' = whole window.
-  const MONTHS_LIST = ['Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec', 'Jan', 'Feb', 'Mar'];
+  // Calendar month / year options (shared logic in lib/fy): no future years/months, the
+  // current year caps at this month, 5 past years; the selected year is always kept.
+  const monthOptionsFor = monthsForYear;
+  const monthOptions = monthsForYear(filterYear);
+  const YEAR_OPTIONS = yearOptions(5, filterYear);
   // The matched / near-miss buckets render as a joined row table (current page only).
   const JOINED_KEYS = ['matched', 'datediff', 'gstdiff', 'valuediff', 'vendordiff', 'nobill'];
   const joinedRows = JOINED_KEYS.includes(unmatchedSection) ? sectionData.rows : null;
+  const impgRows = IMPG_KEYS.includes(unmatchedSection) ? sectionData.rows : null;
   // The not-matched near-miss buckets allow a manual reconcile straight from the table.
   const joinedReconcilable = ['gstdiff', 'valuediff', 'vendordiff', 'nobill'].includes(unmatchedSection);
   const totalPages = Math.max(1, Math.ceil((sectionData.total || 0) / (sectionData.pageSize || defaultPageSize(tab))));
@@ -270,10 +297,40 @@ export default function Dashboard() {
     matched: 'Reconciled bills — GSTIN, bill no., value and date all agree (within ±₹5 / ±10 days).',
     datediff: 'Reconciled bills — GSTIN, bill no. and value agree, but the invoice date differs.',
     manual: 'Bills reconciled manually by a user (with the 2B GSTIN / bill they entered).',
+    impgsap: 'Import IGST (Bill-of-Entry) booked in SAP customs docs, not yet found in the 2B IMPG section.',
+    impg2b: 'Imports in the 2B IMPG section (Bill-of-Entry) not booked in SAP.',
+    impgmatched: 'Reconciled imports — Bill-of-Entry number and IGST value agree between SAP and the 2B.',
   };
 
   // Export the ENTIRE current section (not just the visible page) to an .xlsx.
   const [exporting, setExporting] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Re-fetch SAP + re-reconcile the currently-viewed period against CURRENT SAP data
+  // (no re-upload) — picks up bills booked since the last run, drops reversed ones.
+  const refreshFromSap = async () => {
+    if (filterMonth === 'All') { alert('Pick a specific month to refresh.'); return; }
+    if (!window.confirm(`Re-fetch SAP and re-reconcile ${filterMonth} ${filterYear} against current SAP data? This may take up to a minute.`)) return;
+    setRefreshing(true);
+    try {
+      const start = await fetch(`/api/reconcile/refresh?month=${encodeURIComponent(filterMonth)}&year=${encodeURIComponent(filterYear)}`, { method: 'POST', headers: authHeaders() });
+      if (!start.ok) { const d = await start.json().catch(() => ({})); throw new Error(d.error || 'Failed to start refresh'); }
+      const done = await new Promise((resolve, reject) => {
+        const poll = async () => {
+          try {
+            const r = await fetch('/api/reconcile/progress', { headers: authHeaders() });
+            if (r.ok) { const p = await r.json(); if (p && p.done) { if (p.error) return reject(new Error(p.error)); return resolve(p); } }
+          } catch { /* transient — keep polling */ }
+          setTimeout(poll, 2000);
+        };
+        poll();
+      });
+      await loadCounts(filterMonth, filterYear);
+      await loadSection(unmatchedSection, 1, filterMonth, filterYear);
+      const warn = done.result && done.result.warning;
+      alert(warn ? `Refreshed — but ⚠ ${warn}` : 'Refreshed against current SAP data.');
+    } catch (e) { alert(`Refresh error: ${e.message}`); } finally { setRefreshing(false); }
+  };
   const exportCurrent = async () => {
     const fname = `gst-${tab}-${unmatchedSection}-${filterMonth}-${filterYear}.xlsx`;
     setExporting(true);
@@ -299,6 +356,12 @@ export default function Dashboard() {
           'SAP SGST': x.SAP_SGST, 'SAP CGST': x.SAP_CGST, 'SAP IGST': x.SAP_IGST,
           '2B GST (entered)': x.ExcelGST, '2B Bill (entered)': x.ExcelBill,
           'Invoice Date': fmtXlsDate(x.InvoiceDate), 'Reconciled On': fmtXlsDate(x.ReconciledAt),
+        })), fname);
+      } else if (IMPG_KEYS.includes(unmatchedSection)) {
+        downloadXlsx(rows.map((x) => ({
+          'Bill of Entry': x.Boe, 'Port': x.PortCode,
+          '2B IGST': x.Igst, 'SAP IGST': x.SapIgst, 'IGST Diff': x.TaxDelta,
+          '2B BoE Date': fmtXlsDate(x.InvoiceDate), 'SAP Date': fmtXlsDate(x.SapDate), 'SAP Doc': x.SapDocNo,
         })), fname);
       } else {
         downloadXlsx(rows.map((x) => ({
@@ -367,6 +430,7 @@ export default function Dashboard() {
             setFileName={setFileName}
             unmatchedBills={unmatchedBills}
             setUnmatchedBills={setUnmatchedBills}
+            onReconciled={(m, y) => { if (m) setFilterMonth(m); if (y) setFilterYear(String(y)); }}
           />
         )}
 
@@ -392,7 +456,8 @@ export default function Dashboard() {
                   ))}
                 </div>
 
-                {/* Month / year filter — "All months" shows the whole 2-FY window */}
+                {/* Month / year filter — FY-aware: no future years/months; "All months"
+                    shows the whole window. Defaults to the latest reconciled period. */}
                 <div className="flex flex-wrap items-center gap-2 mb-4">
                   <span className="text-xs font-medium text-muted-foreground">Show month:</span>
                   <select
@@ -401,14 +466,19 @@ export default function Dashboard() {
                     className="h-9 rounded-xl border border-border bg-card px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20"
                   >
                     <option value="All">All months</option>
-                    {MONTHS_LIST.map((m) => <option key={m} value={m}>{m}</option>)}
+                    {monthOptions.map((m) => <option key={m} value={m}>{m}</option>)}
                   </select>
                   <select
                     value={filterYear}
-                    onChange={(e) => changeFilter(filterMonth, e.target.value)}
+                    onChange={(e) => {
+                      const y = e.target.value;
+                      // clamp the month if it's no longer valid for the newly-picked year
+                      const m = (filterMonth === 'All' || monthOptionsFor(y).includes(filterMonth)) ? filterMonth : 'All';
+                      changeFilter(m, y);
+                    }}
                     className="h-9 rounded-xl border border-border bg-card px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20"
                   >
-                    {[String(Number(filterYear) - 1), filterYear, String(Number(filterYear) + 1)].map((y) => <option key={y} value={y}>{y}</option>)}
+                    {YEAR_OPTIONS.map((y) => <option key={y} value={y}>{y}</option>)}
                   </select>
                   <div className="relative w-full sm:w-72">
                     <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground w-4 h-4" />
@@ -421,9 +491,17 @@ export default function Dashboard() {
                     />
                   </div>
                   <button
+                    onClick={refreshFromSap}
+                    disabled={refreshing || filterMonth === 'All'}
+                    title={filterMonth === 'All' ? 'Pick a specific month to refresh' : 'Re-fetch SAP and re-reconcile this month against current SAP data'}
+                    className="ml-auto h-9 px-4 rounded-xl border border-border bg-card text-foreground text-sm font-medium hover:bg-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {refreshing ? 'Refreshing…' : '↻ Refresh from SAP'}
+                  </button>
+                  <button
                     onClick={exportCurrent}
                     disabled={exporting}
-                    className="ml-auto h-9 px-4 rounded-xl border border-primary/20 bg-primary/10 text-primary text-sm font-medium hover:bg-primary hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-9 px-4 rounded-xl border border-primary/20 bg-primary/10 text-primary text-sm font-medium hover:bg-primary hover:text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {exporting ? 'Exporting…' : 'Export to Excel'}
                   </button>
@@ -504,6 +582,52 @@ export default function Dashboard() {
                     </div>
                     {sectionData.total === 0 && (
                       <div className="text-center py-12 text-muted-foreground">No bills in this category for this selection.</div>
+                    )}
+                    {renderPager()}
+                  </div>
+                ) : impgRows ? (
+                  <div>
+                    <div className="overflow-x-auto rounded-2xl border border-border bg-card shadow-sm">
+                      <div className="max-h-[600px] overflow-y-auto">
+                        <table className="w-full text-sm text-left whitespace-nowrap">
+                          <thead className="text-xs text-muted-foreground uppercase bg-muted/50 border-b border-border sticky top-0 z-10 backdrop-blur-md">
+                            <tr>
+                              <th className="px-4 py-3 font-medium">Sr No.</th>
+                              <th className="px-4 py-3 font-medium">Bill of Entry</th>
+                              <th className="px-4 py-3 font-medium">Port</th>
+                              <th className="px-4 py-3 font-medium text-right">2B IGST</th>
+                              <th className="px-4 py-3 font-medium text-right">SAP IGST</th>
+                              <th className="px-4 py-3 font-medium text-right">IGST Δ</th>
+                              <th className="px-4 py-3 font-medium">2B BoE Date</th>
+                              <th className="px-4 py-3 font-medium">SAP Date</th>
+                              <th className="px-4 py-3 font-medium">SAP Doc</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {impgRows.map((r, i) => {
+                              const n = (v) => (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                              const d = (x) => x ? new Date(x).toLocaleDateString('en-GB') : '—';
+                              const srNo = (sectionData.page - 1) * sectionData.pageSize + i + 1;
+                              return (
+                                <tr key={i} className={`border-b border-border/40 hover:bg-accent/30 transition-colors ${i % 2 ? 'bg-muted/5' : ''}`}>
+                                  <td className="px-4 py-2.5 text-muted-foreground">{srNo}</td>
+                                  <td className="px-4 py-2.5 font-medium text-foreground">{r.Boe || '—'}</td>
+                                  <td className="px-4 py-2.5 text-foreground/80">{r.PortCode || '—'}</td>
+                                  <td className="px-4 py-2.5 text-right text-muted-foreground">{r.Igst != null ? n(r.Igst) : '—'}</td>
+                                  <td className="px-4 py-2.5 text-right text-muted-foreground">{r.SapIgst != null ? n(r.SapIgst) : '—'}</td>
+                                  <td className={`px-4 py-2.5 text-right font-medium ${Math.abs(Number(r.TaxDelta) || 0) > 5 ? 'text-rose-600' : 'text-muted-foreground'}`}>{r.TaxDelta != null ? n(r.TaxDelta) : '—'}</td>
+                                  <td className="px-4 py-2.5 text-foreground/80">{d(r.InvoiceDate)}</td>
+                                  <td className="px-4 py-2.5 text-foreground/80">{d(r.SapDate)}</td>
+                                  <td className="px-4 py-2.5 text-foreground/80">{r.SapDocNo || '—'}</td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                    {sectionData.total === 0 && (
+                      <div className="text-center py-12 text-muted-foreground">No import rows in this category for this selection.</div>
                     )}
                     {renderPager()}
                   </div>

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { FiUploadCloud, FiEye, FiTrash2, FiFileText } from 'react-icons/fi';
 import UnmatchedBills from './UnmatchedBills';
+import { yearOptions, monthsForYear, MONTH_LABEL, currentYear } from '../lib/fy';
 
 const FileUpload = ({
   onFileUpload,
@@ -18,36 +19,27 @@ const FileUpload = ({
   endpoints,
   setIsUploaded,
   setShowPreview,
-  setFileName
+  setFileName,
+  onReconciled,
 }) => {
   const [isDragging, setIsDragging] = useState(false);
-  const [months] = useState([
-    { value: 'Jan', label: 'January' },
-    { value: 'Feb', label: 'February' },
-    { value: 'Mar', label: 'March' },
-    { value: 'Apr', label: 'April' },
-    { value: 'May', label: 'May' },
-    { value: 'Jun', label: 'June' },
-    { value: 'Jul', label: 'July' },
-    { value: 'Aug', label: 'August' },
-    { value: 'Sep', label: 'September' },
-    { value: 'Oct', label: 'October' },
-    { value: 'Nov', label: 'November' },
-    { value: 'Dec', label: 'December' },
-  ]);
   const [docEntry, setDocEntry] = useState(null);
-  const [selectedYear, setSelectedYear] = useState('');
+  const [selectedYear, setSelectedYear] = useState(() => localStorage.getItem('selectedYear') || String(currentYear()));
   const [unmatchedBills, setUnmatchedBills] = useState([]);
   const [isReconciled, setIsReconciled] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [showProgress, setShowProgress] = useState(false);
   const [rowProgress, setRowProgress] = useState({ current: 0, total: 0 });
+  const [progressPhase, setProgressPhase] = useState('');
 
   useEffect(() => {
-    const storedYear = localStorage.getItem('selectedYear');
-    if (storedYear) {
-      setSelectedYear(storedYear);
-    }
+    // Default the upload year to the current calendar year (no future years offered) and
+    // PERSIST it, so the year is never '' at reconcile time. Fixes the bug where selecting
+    // a month + Reconcile on first load errored (year state was '' until the dropdown was
+    // toggled) — now the year is a valid value from the first render.
+    const y = localStorage.getItem('selectedYear') || String(currentYear());
+    setSelectedYear(y);
+    localStorage.setItem('selectedYear', y);
   }, []);
 
   // Effect to restore state from localStorage on component mount
@@ -105,6 +97,12 @@ const FileUpload = ({
     const year = e.target.value;
     setSelectedYear(year);
     localStorage.setItem('selectedYear', year);
+    // drop the chosen month if it isn't valid for the newly-picked year (e.g. a future
+    // month of the current year)
+    if (selectedMonth && !monthsForYear(year).includes(selectedMonth)) {
+      setSelectedMonth('');
+      localStorage.removeItem('selectedMonth');
+    }
   };
 
   const handleFile = (file) => {
@@ -146,143 +144,84 @@ const FileUpload = ({
       alert('Please select a month first');
       return;
     }
-
-    // Hoisted so the finally block can always clear it (fix vs. original).
-    let progressInterval;
+    if (!selectedYear) {
+      alert('Please select a year first');
+      return;
+    }
 
     try {
       setIsProcessing(true);
       setShowProgress(true);
       setUploadProgress(0);
       setRowProgress({ current: 0, total: 0 });
+      setProgressPhase('Starting…');
 
-      // Start polling for row-level progress
-      progressInterval = setInterval(async () => {
-        try {
-          const res = await fetch('/api/reconcile/progress', {
-            headers: {
-              'Authorization': `Bearer ${localStorage.getItem('sessionId')}`,
-              'X-Database': localStorage.getItem('database')
-            }
-          });
-          if (res.ok) {
-            const progress = await res.json();
-            if (progress && progress.total > 0) {
-              setRowProgress(progress);
-              if (progress.current > 0) {
-                const processingPercent = (progress.current / progress.total) * 100;
-                setUploadProgress(Math.max(uploadProgress, processingPercent));
-              }
-            }
-          }
-        } catch (err) {
-          console.error('Progress polling error:', err);
+      const database = localStorage.getItem('database');
+      const sessionId = localStorage.getItem('sessionId');
+      const authHeaders = { 'Authorization': `Bearer ${sessionId}`, 'X-Database': database };
+
+      // Stage 1/2: replace any existing entry for this month.
+      const responseCheck = await fetch(`/api/reconcile/check/${selectedMonth}`, { method: 'GET', headers: authHeaders });
+      if (responseCheck.ok) {
+        const existingDocEntry = await responseCheck.json();
+        if (existingDocEntry) {
+          await fetch(`/api/reconcile/delete/${existingDocEntry}`, { method: 'DELETE', headers: authHeaders });
         }
-      }, 3000);
+      }
 
+      // Stage 3: start the background reconcile — returns immediately (202). The SAP
+      // fetch + match runs server-side; we poll /progress for phase + final result.
       const formData = new FormData();
       formData.append('file', uploadedFile);
       formData.append('month', selectedMonth);
       formData.append('year', selectedYear);
+      const startRes = await fetch(endpoints.reconcile, { method: 'POST', body: formData, headers: authHeaders });
+      if (!startRes.ok) throw new Error('Failed to start reconciliation');
 
-      const database = localStorage.getItem('database');
-      const sessionId = localStorage.getItem('sessionId');
-
-      // Stage 1: Checking and clearing existing entries
-      const responseCheck = await fetch(`/api/reconcile/check/${selectedMonth}`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${sessionId}`,
-          'X-Database': database
-        }
-      });
-
-      if (responseCheck.ok) {
-        const existingDocEntry = await responseCheck.json();
-        if (existingDocEntry) {
-          // Stage 2: Deleting existing entry
-          await fetch(`/api/reconcile/delete/${existingDocEntry}`, {
-            method: 'DELETE',
-            headers: {
-              'Authorization': `Bearer ${sessionId}`,
-              'X-Database': database
-            }
-          });
-        }
-      }
-
-      // Stage 3: Uploading and processing file
-      const response = await new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-
-        xhr.addEventListener('load', async () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            try {
-              const data = JSON.parse(xhr.responseText);
-              console.log('Reconciliation response:', data);
-              alert('File processed successfully!');
-              setIsReconciled(true);
-
-              if (data.unmatchedBills && data.unmatchedBills.length > 0) {
-                setUnmatchedBills(data.unmatchedBills);
-                localStorage.setItem('unmatchedBills', JSON.stringify(data.unmatchedBills));
-              } else {
-                setUnmatchedBills([]);
-                localStorage.removeItem('unmatchedBills');
+      // Stage 4: poll until the background job reports done (or error).
+      const data = await new Promise((resolve, reject) => {
+        const poll = async () => {
+          try {
+            const res = await fetch('/api/reconcile/progress', { headers: authHeaders });
+            if (res.ok) {
+              const p = await res.json();
+              if (p) {
+                if (p.phase) setProgressPhase(p.phase);
+                if (p.total > 0) {
+                  setRowProgress({ current: p.current || 0, total: p.total });
+                  if (p.current > 0) setUploadProgress((p.current / p.total) * 100);
+                }
+                if (p.done) {
+                  if (p.error) return reject(new Error(p.error));
+                  return resolve({ result: p.result, unmatchedBills: p.unmatchedBills || [] });
+                }
               }
-
-              setUploadProgress(100);
-              setIsProcessing(false);
-              setTimeout(() => setShowProgress(false), 500);
-
-              resolve(data);
-            } catch (error) {
-              console.error('Error parsing response:', error);
-              setIsProcessing(false);
-              reject(new Error('Failed to parse server response'));
             }
-          } else {
-            setIsProcessing(false);
-            reject(new Error('Failed to process file'));
-          }
-        });
-
-        xhr.addEventListener('error', () => {
-          setIsProcessing(false);
-          reject(new Error('Network error occurred'));
-        });
-
-        xhr.addEventListener('abort', () => {
-          setIsProcessing(false);
-          reject(new Error('Upload aborted'));
-        });
-
-        xhr.open('POST', endpoints.reconcile);
-        xhr.setRequestHeader('Authorization', `Bearer ${sessionId}`);
-        xhr.setRequestHeader('X-Database', database);
-
-        xhr.send(formData);
+          } catch (err) { /* transient network error — keep polling */ }
+          setTimeout(poll, 2000);
+        };
+        poll();
       });
 
-      if (response.unmatchedBills) {
-        await new Promise(resolve => {
-          const checkUnmatchedBills = () => {
-            if (unmatchedBills.length === response.unmatchedBills.length) {
-              resolve();
-            } else {
-              setTimeout(checkUnmatchedBills, 100);
-            }
-          };
-          checkUnmatchedBills();
-        });
-      }
+      console.log('Reconciliation response:', data);
+      alert('File processed successfully!');
+      setIsReconciled(true);
+      // Tell the dashboard which period was just reconciled, so the Unmatched/Matched
+      // views default to THIS month (not "All months").
+      if (onReconciled) onReconciled(selectedMonth, selectedYear);
 
+      if (data.unmatchedBills && data.unmatchedBills.length > 0) {
+        setUnmatchedBills(data.unmatchedBills);
+        localStorage.setItem('unmatchedBills', JSON.stringify(data.unmatchedBills));
+      } else {
+        setUnmatchedBills([]);
+        localStorage.removeItem('unmatchedBills');
+      }
+      setUploadProgress(100);
     } catch (error) {
       console.error('Reconciliation error:', error);
-      setIsProcessing(false);
       alert(`Error: ${error.message}`);
     } finally {
-      if (progressInterval) clearInterval(progressInterval);
       setShowProgress(false);
       setIsProcessing(false);
     }
@@ -340,30 +279,26 @@ const FileUpload = ({
   return (
         <div className="w-full animate-fade-in max-w-4xl mx-auto space-y-6 pt-4">
             <div className="bg-card rounded-2xl border border-border shadow-sm p-6 sm:p-8">
+                {/* Year first, then the months valid for that FY (no future periods). */}
                 <div className="flex flex-col sm:flex-row items-center gap-4 mb-8">
+                    <select
+                        value={selectedYear}
+                        onChange={handleYearChange}
+                        className="h-11 w-full sm:w-48 rounded-xl border border-border bg-background px-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all font-medium"
+                    >
+                        {yearOptions(5, selectedYear).map((year) => (
+                            <option key={year} value={year}>{year}</option>
+                        ))}
+                    </select>
+
                     <select
                         value={selectedMonth}
                         onChange={handleMonthChange}
                         className="h-11 w-full sm:w-48 rounded-xl border border-border bg-background px-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all font-medium"
                     >
                         <option value="">Select Month</option>
-                        {months.map((month) => (
-                            <option key={month.value} value={month.value}>
-                                {month.label}
-                            </option>
-                        ))}
-                    </select>
-
-                    <select
-                        value={selectedYear}
-                        onChange={handleYearChange}
-                        className="h-11 w-full sm:w-48 rounded-xl border border-border bg-background px-4 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all font-medium"
-                    >
-                        <option value="">Select Year</option>
-                        {Array.from({ length: 31 }, (_, i) => 2020 + i).map((year) => (
-                            <option key={year} value={year}>
-                                {year}
-                            </option>
+                        {monthsForYear(selectedYear).map((m) => (
+                            <option key={m} value={m}>{MONTH_LABEL[m]}</option>
                         ))}
                     </select>
                 </div>
@@ -452,9 +387,11 @@ const FileUpload = ({
                 <div className="bg-card rounded-2xl border border-border shadow-sm p-6 animate-fade-in-up">
                     <div className="flex items-center justify-between mb-3 text-sm">
                         <span className="font-medium text-foreground">
-                            {rowProgress.total > 0
-                                ? `Processing row ${rowProgress.current} of ${rowProgress.total}...`
-                                : 'Uploading and Processing...'}
+                            {progressPhase
+                                ? progressPhase
+                                : rowProgress.total > 0
+                                    ? `Processing row ${rowProgress.current} of ${rowProgress.total}...`
+                                    : 'Uploading and Processing...'}
                         </span>
                         <span className="text-muted-foreground font-semibold">
                             {rowProgress.total > 0 ? ((rowProgress.current / rowProgress.total) * 100).toFixed(0) : '...'}%

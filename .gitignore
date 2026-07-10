@@ -4,7 +4,8 @@ client/node_modules/
 
 # Secrets / environment (NEVER commit) — .env.example is kept as the template
 .env
-.env.local
+.env.*
+!.env.example
 
 # Build output
 client/dist/
@@ -25,3 +26,6 @@ docs/
 # Logs / temp
 *.log
 tmp/
+
+*.pdf
+*.rtf
