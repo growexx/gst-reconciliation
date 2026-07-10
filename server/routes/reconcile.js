@@ -13,7 +13,9 @@ router.use(verifyToken);
 
 // ── GSTR-2A/2B reconciliation ──
 router.post('/upload', upload.single('file'), reconcile.processFile.bind(reconcile));
+router.post('/refresh', reconcile.refresh.bind(reconcile));
 router.get('/progress', reconcile.getProgress.bind(reconcile));
+router.get('/periods', reconcile.fetchPeriods.bind(reconcile));
 router.get('/check/:month', reconcile.getPeriodByMonth.bind(reconcile));
 router.delete('/delete/:periodId', reconcile.deletePeriod.bind(reconcile));
 router.get('/fetch-sap-bills', reconcile.fetchBills.bind(reconcile));

@@ -88,14 +88,23 @@ Matching lives in two layers and the distinction matters:
     Bills with a GSTIN but no name still get their name resolved from the vendor
     master by GSTIN at read time (display only — see `_vendorByGstin`).
 
-**Determinism is a hard requirement.** Re-running the same 2B file must produce
-the identical result. Two mechanisms enforce this and must be preserved:
+**Determinism (against a fixed SAP snapshot) is a hard requirement.** Re-running the
+same 2B file against *unchanged* SAP data must produce the identical result. SAP is
+now fetched on-demand at reconcile time (`SAP_FETCH_ON_RECONCILE`), so the result
+tracks live SAP *by design*: bills booked, amended, or reversed since the last run
+change it. A partial fetch (non-zero `failed`) is surfaced as a `warning`, not
+silently absorbed — treat a warned run as provisional and re-run. Three mechanisms
+enforce determinism against a fixed snapshot and must be preserved:
 - The matcher's scoring has explicit tie-breaks (lower invoice key wins) and a
   guard so a missing/invalid date can't poison the score to `Infinity`.
 - `importPortalFile` step 4 **resets** all auto-backfilled state at the start of
   every upload (`reconciledAuto` invoices un-reconciled; `gstinSource` of `2B` /
   `RBKP-promoted` / `sibling` cleared) so a prior run's adopted GSTINs don't drift
   the next match. Manual reconciliations (`reconciledAuto:false`) are preserved.
+- `syncSapWindow` cancels (`cancelled:true`) any stored invoice SAP now flags as
+  **reversed** (`buildInvoices` returns `reversedKeys`), but only on a fully
+  successful fetch (`failed===0`) — so a reversed bill stops matching, while a
+  transient fetch gap can never wrongly drop a live bill.
 
 Tolerances are constants in matcher.js: `AMOUNT_TOLERANCE = 5` (rupees, on **total**
 tax), `DATE_WINDOW_DAYS = 10`. Note the matcher compares *total* tax, not

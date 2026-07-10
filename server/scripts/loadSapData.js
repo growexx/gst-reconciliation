@@ -30,22 +30,37 @@ const arg = (name, def) => { const i = process.argv.indexOf(name); return i !== 
 const COMPANY = arg('--company', (process.env.COMPANIES || 'Nandan Terry').split(',')[0].trim());
 const FRESH = process.argv.includes('--fresh');
 
-// BKPF source (the agreed vendor-invoice source) — the FULL extract. Override via
-// SAP_BKPF_FILE. ('bkpf smaller.xlsx' was a partial subset; do not use it.)
-const BKPF_FILE = { file: process.env.SAP_BKPF_FILE || 'BKPF Full Data.xlsx', dir: ROOT, sheet: null };
-const BSET_FILES = [{ file: 'BSET data.xlsx', dir: NT }, { file: 'BSET data.xlsx', dir: ROOT }];
-// Both the NT and the root BSEG extracts are needed — the root file holds vendor
-// lines (≈34 docs) that the NT extract is missing. buildVendorByDoc unions them
-// (first-seen per document wins; later files only add documents not already present).
+// Combined Oct-2025 → Mar-2026 workbook (prior half-FY). Its BKPF / Bset / RBKP sheets
+// are read (each is under Node's ~512 MB-per-sheet string limit); its BSEG lives in a
+// >1 GB sheet that SheetJS cannot load, so Oct-Mar BSEG is DEFERRED until it's re-exported
+// as CSV / monthly splits. All reads below are per-file try/catch, so an unreadable sheet
+// is skipped rather than failing the whole load.
+const OCT_MAR = 'Oct-25  to March-26.xlsx';
+
+// BKPF source(s): the full current extract + the Oct-Mar workbook's BKPF sheet. Override
+// the primary via SAP_BKPF_FILE. buildBkpfInvoices unions them (first-seen docNo|year wins).
+const BKPF_FILES = [
+  { file: process.env.SAP_BKPF_FILE || 'BKPF Full Data.xlsx', dir: ROOT, sheet: null },
+  { file: OCT_MAR, dir: ROOT, sheet: 'BKPF' },
+];
+const BSET_FILES = [
+  { file: 'BSET data.xlsx', dir: NT }, { file: 'BSET data.xlsx', dir: ROOT },
+  { file: OCT_MAR, dir: ROOT, sheet: 'Bset' },
+];
+// Both the NT and the root BSEG extracts are needed — the root file holds vendor lines
+// (≈34 docs) the NT extract is missing. buildVendorByDoc unions them (first-seen per
+// document wins). NOTE: Oct-Mar BSEG is deferred (its sheet is >1 GB; add here once
+// re-exported as CSV / monthly splits).
 const BSEG_FILES = [{ file: 'BSEG data.xlsx', dir: NT }, { file: 'BSEG data.xlsx', dir: ROOT }];
 const ACDOCA_FILE = { file: 'ACDOCA.xlsx', dir: ROOT };
 const LFA1_GST = { file: 'LFA1 DATA GST.xlsx', dir: ROOT };
-// RBKP is NOT a primary source — used (a) as a FALLBACK to fill the vendor code/GSTIN
-// for BKPF docs with no SAP vendor line, and (b) for RBKP-only bills not in BKPF at all
-// (matched by reference + tax). 'RBKP Data Full.xlsx' is the COMPLETE extract (its 4760
-// RE rows == the old NT file + the april-26 workbook sheet combined), so it replaces
-// both partials. Columns: Reference @7, Inv. Pty @9, VAT @160, Tax,error @173.
-const RBKP_FILES = [{ file: 'RBKP Data Full.xlsx', dir: ROOT }];
+// RBKP — vendor/GSTIN fallback + RBKP-only bills. 'RBKP Data Full.xlsx' is the complete
+// current extract; the Oct-Mar workbook's RBKP sheet extends it back.
+// Columns: Reference @7, Inv. Pty @9, VAT @160, Tax,error @173.
+const RBKP_FILES = [
+  { file: 'RBKP Data Full.xlsx', dir: ROOT },
+  { file: OCT_MAR, dir: ROOT, sheet: 'RBKP' },
+];
 // Document types loaded from BKPF, and which GSTR-2B section each reconciles against:
 //   RE = MM invoice, KR = FI invoice  -> B2B section   (vendor invoices)
 //   KG = credit/debit note            -> B2B-CDNR section
@@ -200,12 +215,14 @@ function buildRbkpOnlyInvoices(bkpfRefs, vendorMaster) {
 }
 
 function buildBkpfInvoices(bsetSplit, vendorByDoc, vendorMaster, rbkpByRef) {
-  const rows = read(BKPF_FILE); const H = rows[0];
-  const B = { doc: H.indexOf('DocumentNo'), ref: H.indexOf('Reference'), year: H.indexOf('Year'), type: H.indexOf('Type'), date: H.indexOf('Doc. Date') };
-  const rev = H.indexOf('Reversal');           // not present in every extract
   const out = []; const seen = new Set();
   const stat = { total: 0, withTax: 0, withGstin: 0, fromBseg: 0, fromRbkp: 0, byType: {} };
-  for (const r of rows.slice(1)) {
+  for (const src of BKPF_FILES) {
+    let rows; try { rows = read(src); } catch (e) { console.warn(`  BKPF: skipped ${src.file}${src.sheet ? '::' + src.sheet : ''} (${e.message})`); continue; }
+    const H = rows[0]; if (!H) continue;
+    const B = { doc: H.indexOf('DocumentNo'), ref: H.indexOf('Reference'), year: H.indexOf('Year'), type: H.indexOf('Type'), date: H.indexOf('Doc. Date') };
+    const rev = H.indexOf('Reversal');           // not present in every extract
+    for (const r of rows.slice(1)) {
     const type = r[B.type];
     if (!VENDOR_TYPES.has(type)) continue;
     if (rev >= 0 && r[rev] != null && String(r[rev]).trim() !== '') continue; // skip reversed when the column exists
@@ -255,6 +272,7 @@ function buildBkpfInvoices(bsetSplit, vendorByDoc, vendorMaster, rbkpByRef) {
       tax, cgst: +split.cgst.toFixed(2), sgst: +split.sgst.toFixed(2), igst: +split.igst.toFixed(2),
       cancelled: false,
     });
+    }
   }
   return { invoices: out, stat };
 }
@@ -286,7 +304,7 @@ async function upsertVendors(vendorMaster) {
 }
 
 (async () => {
-  console.log(`SAP→Mongo ETL (BKPF-driven) | company=${COMPANY} | fresh=${FRESH} | BKPF=${BKPF_FILE.file}`);
+  console.log(`SAP→Mongo ETL (BKPF-driven) | company=${COMPANY} | fresh=${FRESH} | BKPF=${BKPF_FILES.map((f) => f.file + (f.sheet ? '::' + f.sheet : '')).join(', ')}`);
   await connect();
   if (FRESH) { const r = await collections.apInvoices().deleteMany({ companyId: COMPANY }); console.log(`  cleared ${r.deletedCount} existing ap_invoices`); }
 

@@ -13,6 +13,16 @@ function sessionOf(req) {
     return req.headers.authorization?.split(' ')[1];
 }
 
+// Record a job's terminal (done) state, then evict it after a grace period so the
+// in-memory progress Map can't grow one dangling entry per completed job. The client
+// has polled the final result long before the timer fires. unref() so a pending
+// eviction never keeps the process alive.
+function settleProgress(sessionId, payload) {
+    progressStore.set(sessionId, { ...payload, done: true });
+    const t = setTimeout(() => progressStore.delete(sessionId), 60000);
+    if (typeof t.unref === 'function') t.unref();
+}
+
 class ReconcileController {
     async processFile(req, res) {
         try {
@@ -23,19 +33,59 @@ class ReconcileController {
             if (!month || !year) {
                 return res.status(400).json({ error: 'Missing required parameters (month, year)' });
             }
+            if (!sessionId) return res.status(401).json({ error: 'Unauthorized' });
 
-            const { result, unmatchedBills } = await reconcileService.importPortalFile(
-                req.file.buffer, companyId, month, year, sessionId,
-                (current, total) => progressStore.set(sessionId, { current, total }),
-            );
+            // Run the reconcile in the BACKGROUND — the on-demand SAP fetch can take a
+            // while, so we return 202 immediately and the client polls /progress for the
+            // phase and the final result (so the upload request never blocks/times out).
+            const buf = req.file.buffer;
+            progressStore.set(sessionId, { phase: 'Starting…', current: 0, total: 0, done: false });
+            const report = (p) => {
+                const prev = progressStore.get(sessionId) || {};
+                progressStore.set(sessionId, { ...prev, ...(p && typeof p === 'object' ? p : {}), done: false });
+            };
+            reconcileService.importPortalFile(buf, companyId, month, year, sessionId, report)
+                .then(({ result, unmatchedBills }) => {
+                    settleProgress(sessionId, { phase: 'Done', result, unmatchedBills });
+                })
+                .catch((error) => {
+                    console.error('Reconciliation error:', error.message);
+                    settleProgress(sessionId, { phase: 'Error', error: error.message || 'Reconciliation failed' });
+                });
 
-            progressStore.delete(sessionId);
-            res.json({ success: true, result, unmatchedBills });
+            return res.status(202).json({ running: true });
         } catch (error) {
-            console.error('Reconciliation error:', error.message);
-            const sid = sessionOf(req);
-            if (sid) progressStore.delete(sid);
-            res.status(500).json({ error: error.message || 'An error occurred while processing the file' });
+            console.error('Reconciliation start error:', error.message);
+            res.status(500).json({ error: error.message || 'Failed to start reconciliation' });
+        }
+    }
+
+    // POST /refresh?month=&year= — re-reconcile a stored period against CURRENT SAP data
+    // (no re-upload). Background job like processFile; client polls /progress.
+    async refresh(req, res) {
+        try {
+            const companyId = companyOf(req);
+            const sessionId = sessionOf(req);
+            const { month, year } = req.query;
+            if (!month || !year) return res.status(400).json({ error: 'Missing month/year' });
+            if (month === 'All') return res.status(400).json({ error: 'Pick a specific month to refresh.' });
+            if (!sessionId) return res.status(401).json({ error: 'Unauthorized' });
+
+            progressStore.set(sessionId, { phase: 'Starting refresh…', current: 0, total: 0, done: false });
+            const report = (p) => {
+                const prev = progressStore.get(sessionId) || {};
+                progressStore.set(sessionId, { ...prev, ...(p && typeof p === 'object' ? p : {}), done: false });
+            };
+            reconcileService.refreshPeriod(companyId, month, year, report)
+                .then(({ result, unmatchedBills }) => { settleProgress(sessionId, { phase: 'Done', result, unmatchedBills }); })
+                .catch((error) => {
+                    console.error('Refresh error:', error.message);
+                    settleProgress(sessionId, { phase: 'Error', error: error.message || 'Refresh failed' });
+                });
+            return res.status(202).json({ running: true });
+        } catch (error) {
+            console.error('Refresh start error:', error.message);
+            res.status(500).json({ error: error.message || 'Failed to start refresh' });
         }
     }
 
@@ -43,6 +93,15 @@ class ReconcileController {
         const sessionId = sessionOf(req);
         if (!sessionId) return res.status(401).json({ error: 'Unauthorized' });
         res.json(progressStore.get(sessionId) || { current: 0, total: 0 });
+    }
+
+    async fetchPeriods(req, res) {
+        try {
+            res.json(await reconcileService.getPeriods(companyOf(req)));
+        } catch (error) {
+            console.error('Error fetching periods:', error.message);
+            res.status(500).json({ error: 'Failed to fetch periods' });
+        }
     }
 
     async getPeriodByMonth(req, res) {

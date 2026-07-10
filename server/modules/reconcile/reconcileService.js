@@ -9,7 +9,14 @@
 const xlsx = require('xlsx');
 const { ObjectId } = require('mongodb');
 const { collections } = require('../../config/db');
-const { normalizeInvoiceNum, reconcile, MATCHED_CATEGORIES } = require('./matcher');
+const { normalizeInvoiceNum, reconcile, matchImpg, MATCHED_CATEGORIES } = require('./matcher');
+const { fetchWindow } = require('../sap/sapClient');
+const { buildInvoices } = require('../sap/sapTransform');
+
+// When true (default), each 2B upload pulls that month's SAP data on-demand via the
+// /zapi_tables API and upserts ap_invoices before matching. Set SAP_FETCH_ON_RECONCILE
+// =false to reconcile against whatever the offline ETL (loadSapData.js) already loaded.
+const SAP_FETCH_ON_RECONCILE = process.env.SAP_FETCH_ON_RECONCILE !== 'false';
 
 // ── Fallback header mapping for an already-flat portal sheet ───────────────
 const HEADER_ALIASES = {
@@ -79,6 +86,26 @@ function fyWindow(month, year) {
 const GSTIN_RE = /^[0-9]{2}[A-Z0-9]{13}$/i;
 
 /**
+ * Map canonical column names → indexes by matching header TEXT (whitespace-stripped,
+ * lowercased) across the header block, per column. Robust to GSTR-2B layout changes —
+ * e.g. the newer IMS-format 2B inserts a "Rate(%)" column that shifts the tax columns,
+ * which would break any fixed-position parser. Only returns keys it actually finds.
+ */
+function detectColumns(headerRows, patterns) {
+    let ncol = 0;
+    for (const r of headerRows) if (Array.isArray(r)) ncol = Math.max(ncol, r.length);
+    const colText = [];
+    for (let c = 0; c < ncol; c++) {
+        colText[c] = headerRows.map((r) => String((r && r[c] != null) ? r[c] : '')).join(' ').toLowerCase().replace(/\s+/g, '');
+    }
+    const idx = {};
+    for (const [key, pats] of Object.entries(patterns)) {
+        for (let c = 0; c < ncol; c++) { if (pats.some((p) => colText[c].includes(p))) { idx[key] = c; break; } }
+    }
+    return idx;
+}
+
+/**
  * Parse a GSTR-2B workbook (the government B2B sheet has a multi-row header
  * block, so we locate the data by position). Falls back to an alias-based flat
  * parse for already-shaped sheets.
@@ -107,11 +134,18 @@ function parseGstr2bB2B(fileBuffer) {
     }
     if (dataStart === -1) throw new Error('GSTR-2B file: could not locate the B2B data rows.');
 
-    // Standard GSTR-2B B2B column order.
+    // Columns by header label (robust to the newer IMS layout's extra "Rate(%)" column
+    // that shifts the tax columns). Falls back to the classic fixed positions if a label
+    // isn't found.
+    const D = detectColumns(rows.slice(0, dataStart), {
+        gstin: ['gstinofsupplier'], name: ['legalname'], invno: ['invoicenumber'], invtype: ['invoicetype'],
+        invdate: ['invoicedate'], invval: ['invoicevalue'], igst: ['integratedtax'], cgst: ['centraltax'],
+        sgst: ['state/uttax', 'stateuttax'], cess: ['cess'], pos: ['placeofsupply'], itc: ['itcavailability'],
+    });
     const C = {
-        gstin: 0, name: 1, invno: 2, invtype: 3, invdate: 4, invval: 5,
-        pos: 6, rcm: 7, taxable: 8, igst: 9, cgst: 10, sgst: 11, cess: 12,
-        period: 13, filingDate: 14, itc: 15,
+        gstin: D.gstin ?? 0, name: D.name ?? 1, invno: D.invno ?? 2, invtype: D.invtype ?? 3,
+        invdate: D.invdate ?? 4, invval: D.invval ?? 5, pos: D.pos ?? 6,
+        igst: D.igst ?? 9, cgst: D.cgst ?? 10, sgst: D.sgst ?? 11, cess: D.cess ?? 12, itc: D.itc ?? 15,
     };
     const out = [];
     for (let i = dataStart; i < rows.length; i++) {
@@ -157,9 +191,15 @@ function parseGstr2bCDNR(fileBuffer) {
     if (dataStart === -1) return [];
 
     // Standard GSTR-2B B2B-CDNR column order.
+    const D = detectColumns(rows.slice(0, dataStart), {
+        gstin: ['gstinofsupplier'], name: ['legalname'], noteno: ['notenumber'], notetype: ['notetype'],
+        notedate: ['notedate'], noteval: ['notevalue'], igst: ['integratedtax'], cgst: ['centraltax'],
+        sgst: ['state/uttax', 'stateuttax'], cess: ['cess'], pos: ['placeofsupply'],
+    });
     const C = {
-        gstin: 0, name: 1, noteno: 2, notetype: 3, supplytype: 4, notedate: 5, noteval: 6,
-        pos: 7, rcm: 8, taxable: 9, igst: 10, cgst: 11, sgst: 12, cess: 13,
+        gstin: D.gstin ?? 0, name: D.name ?? 1, noteno: D.noteno ?? 2, notetype: D.notetype ?? 3,
+        notedate: D.notedate ?? 5, noteval: D.noteval ?? 6, pos: D.pos ?? 7,
+        igst: D.igst ?? 10, cgst: D.cgst ?? 11, sgst: D.sgst ?? 12, cess: D.cess ?? 13,
     };
     const out = [];
     for (let i = dataStart; i < rows.length; i++) {
@@ -181,6 +221,31 @@ function parseGstr2bCDNR(fileBuffer) {
             integratedTax: num(r[C.igst]),
             cess: num(r[C.cess]),
             itcAvailable: '',
+        });
+    }
+    return out;
+}
+
+/**
+ * Parse the GSTR-2B "IMPG" sheet (import of goods on bill of entry). Two-row header;
+ * data columns: 0 Icegate ref date, 1 port code, 2 BoE number, 3 BoE date, 4 taxable
+ * value, 5 IGST, 6 cess. The normalized Bill-of-Entry number is the match key.
+ * @returns {Array} raw IMPG line objects (pre-DB-shape); [] if the sheet is absent.
+ */
+function parseGstr2bIMPG(fileBuffer) {
+    const wb = xlsx.read(fileBuffer, { type: 'buffer', cellDates: true });
+    const sheetName = wb.SheetNames.find((n) => String(n).trim().toUpperCase() === 'IMPG');
+    if (!sheetName) return [];
+    const rows = xlsx.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: null, blankrows: false });
+    const out = [];
+    for (const r of rows) {
+        const raw = String((r || [])[2] == null ? '' : r[2]).trim();
+        if (!/^\d{3,}$/.test(raw) || r[5] == null) continue;    // BoE-number data rows only
+        out.push({
+            boe: raw.replace(/^0+/, ''),
+            portCode: r[1] != null ? String(r[1]).trim() : '',
+            invoiceDate: parseDate(r[3]),                        // BoE date
+            taxable: num(r[4]), igst: num(r[5]), cess: num(r[6]),
         });
     }
     return out;
@@ -330,6 +395,27 @@ function inMonth(d, year, m0) {
     return x.getUTCFullYear() === Number(year) && x.getUTCMonth() === m0;
 }
 
+// Fetch window = the WHOLE Indian financial year(s) (Apr–Mar) that the uploaded 2B's
+// invoice dates fall in, plus a short tail (SAP_FETCH_MONTHS) past FY-end for bills posted
+// early in the next year. A monthly 2B → that month's full FY; a full-FY "All periods" 2B →
+// the whole year(s) it spans. Falls back to the selected month's FY if lines carry no dates.
+function fetchWindowFromLines(lineDocs, month, year) {
+    const tail = Number(process.env.SAP_FETCH_MONTHS || 2);
+    let loT = Infinity, hiT = -Infinity;
+    for (const l of lineDocs) { const d = l.invoiceDate; if (d instanceof Date && !isNaN(d)) { const t = d.getTime(); if (t < loT) loT = t; if (t > hiT) hiT = t; } }
+    let lo, hi;
+    if (isFinite(loT)) { lo = new Date(loT); hi = new Date(hiT); }
+    else { const m0 = monthIndex0(month); const y = Number(year); lo = new Date(Date.UTC(y, m0 == null ? 3 : m0, 1)); hi = lo; }
+    const fyStartYear = (d) => (d.getUTCMonth() >= 3 ? d.getUTCFullYear() : d.getUTCFullYear() - 1);   // Apr–Mar
+    const fromYear = fyStartYear(lo);            // 1 Apr of the earliest invoice's FY
+    const toFyEndYear = fyStartYear(hi) + 1;     // calendar year of that FY's March
+    const fmt = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+    return {
+        from: fmt(new Date(Date.UTC(fromYear, 3, 1))),                 // 1 Apr (FY start)
+        to: fmt(new Date(Date.UTC(toFyEndYear, 2 + tail + 1, 0))),     // 31 Mar (FY end) + `tail` months
+    };
+}
+
 class ReconcileService {
     async getPeriod(companyId, month, year) {
         return collections.periods().findOne({ companyId, month, year: String(year) });
@@ -341,10 +427,89 @@ class ReconcileService {
         return p ? String(p._id) : null;
     }
 
+    /**
+     * GET /periods — the distinct {month, year} that have been uploaded/reconciled,
+     * latest first, plus `latest` (most recent FY-month). Drives the smart month/year
+     * filter: which periods exist, and what to default the view to.
+     */
+    async getPeriods(companyId) {
+        const docs = await collections.periods()
+            .find({ companyId }, { projection: { month: 1, year: 1 } }).toArray();
+        const MO = { Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6, Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12 };
+        const seen = new Map();   // 'year|month' -> { month, year } (year may be stored as string or number)
+        for (const p of docs) {
+            const year = String(p.year); const key = `${year}|${p.month}`;
+            if (!seen.has(key)) seen.set(key, { month: p.month, year });
+        }
+        const calKey = (p) => Number(p.year) * 100 + (MO[p.month] || 0);   // chronological (calendar)
+        const periods = [...seen.values()].sort((a, b) => calKey(b) - calKey(a));   // latest first
+        return { periods, latest: periods[0] || null };
+    }
+
     async deletePeriod(periodId) {
         const _id = new ObjectId(periodId);
         await collections.lines().deleteMany({ periodId: _id });
         await collections.periods().deleteOne({ _id });
+    }
+
+    /**
+     * Pull one reconcile month's SAP data on-demand (BKPF/BSEG/BSET/RBKP/LFA1 + SA-import
+     * for IMPG) and upsert ap_invoices + vendors. Replaces the offline ETL for the live
+     * path; keyed by (companyId, docNo, fiscalYear) so it is idempotent.
+     */
+    async syncSapWindow(companyId, win, onProgress) {
+        const tables = await fetchWindow({ ...win, onProgress });
+        const { invoices, vendorMaster, reversedKeys } = buildInvoices(tables, companyId);
+
+        const invOps = invoices.filter((i) => i.docNo).map((i) => ({
+            updateOne: {
+                filter: { companyId, docNo: i.docNo, fiscalYear: i.fiscalYear },
+                update: { $set: i, $setOnInsert: { reconciled: false, createdAt: new Date() } },
+                upsert: true,
+            },
+        }));
+        for (let k = 0; k < invOps.length; k += 1000) {
+            await collections.apInvoices().bulkWrite(invOps.slice(k, k + 1000), { ordered: false });
+        }
+
+        const venOps = [];
+        for (const [code, v] of vendorMaster.entries()) {
+            if (!v.gstin) continue;
+            venOps.push({ updateOne: {
+                filter: { companyId, vendorCode: code },
+                update: { $set: { companyId, vendorCode: code, vendorGstin: v.gstin, vendorName: v.name, pan: v.pan, updatedAt: new Date() } },
+                upsert: true,
+            } });
+        }
+        if (venOps.length) for (let k = 0; k < venOps.length; k += 1000) {
+            await collections.vendors().bulkWrite(venOps.slice(k, k + 1000), { ordered: false });
+        }
+
+        // Reversal cleanup: a doc SAP now flags as reversed is dropped from `invoices`, but
+        // a copy from an EARLIER fetch may still sit in ap_invoices and keep matching. Mark
+        // those `cancelled` (the candidate query filters cancelled≠true) and drop any auto/
+        // manual reconciliation on them — a reversed bill must not stay matched. The audit
+        // trail in recon_log is untouched. GUARD: only when the fetch fully succeeded, so a
+        // transient failure (some calls dropped) can never mistake a not-fetched doc for a
+        // reversed one and wrongly cancel a live bill.
+        let cancelledReversed = 0;
+        if ((tables.failed || 0) === 0 && reversedKeys && reversedKeys.size) {
+            const revOps = [...reversedKeys].map((k) => {
+                const p = k.lastIndexOf('|');
+                return { updateOne: {
+                    filter: { companyId, docNo: k.slice(0, p), fiscalYear: k.slice(p + 1) },
+                    update: {
+                        $set: { cancelled: true, reconciled: false },
+                        $unset: { reconciledAuto: '', reconciledAt: '', reconciledPeriodId: '', reconciledCategory: '', reconciledReason: '', reconciledStage: '', reconciledTaxDelta: '', reconciledFlag: '', reconciledTier: '' },
+                    },
+                } };
+            });
+            for (let k = 0; k < revOps.length; k += 1000) {
+                const res = await collections.apInvoices().bulkWrite(revOps.slice(k, k + 1000), { ordered: false });
+                cancelledReversed += res.modifiedCount || 0;
+            }
+        }
+        return { invoices: invoices.length, vendors: venOps.length, window: win, failed: tables.failed || 0, total: tables.total || 0, cancelledReversed };
     }
 
     /**
@@ -361,7 +526,12 @@ class ReconcileService {
         const periods = await collections.periods()
             .find({ companyId, month, year: { $in: [ystr, Number(year)] } }).toArray();
         let period;
-        if (periods.length) {
+        if (!fileBuffer) {
+            // REFRESH: re-reconcile the already-stored 2B for this period against CURRENT
+            // SAP data (no new file). Keep the stored lines as-is.
+            if (!periods.length) throw new Error('Nothing to refresh — upload the 2B for this period first.');
+            period = periods[0];
+        } else if (periods.length) {
             const ids = periods.map((p) => p._id);
             await collections.lines().deleteMany({ periodId: { $in: ids } });
             period = periods[0];
@@ -377,45 +547,73 @@ class ReconcileService {
         }
         const periodId = period._id;
 
-        // 2. Parse both the B2B sheet (vendor invoices) and the B2B-CDNR sheet
-        //    (credit/debit notes). CDNR is optional — older files may not carry it.
-        const b2b = parseGstr2bB2B(fileBuffer);
-        const cdnr = parseGstr2bCDNR(fileBuffer);
-        if (!b2b.length && !cdnr.length) throw new Error('No B2B or CDNR rows found in the GSTR-2B file.');
+        // 2–3. (Upload only) parse B2B / CDNR / IMPG and REPLACE this month's stored lines.
+        //      On a refresh (no file) the stored lines are kept and just re-matched.
+        let insertedCount = 0;
+        if (fileBuffer) {
+            const b2b = parseGstr2bB2B(fileBuffer);
+            const cdnr = parseGstr2bCDNR(fileBuffer);
+            const impg = parseGstr2bIMPG(fileBuffer);
+            if (!b2b.length && !cdnr.length && !impg.length) throw new Error('No B2B, CDNR or IMPG rows found in the GSTR-2B file.');
+            const mkLine = (p, section) => ({
+                periodId, companyId, section,
+                supplierGstin: p.supplierGstin, supplierName: p.supplierName,
+                invoiceNum: p.invoiceNum, normalizedInvoiceNum: normalizeInvoiceNum(p.invoiceNum),
+                invoiceType: p.invoiceType, noteType: p.noteType || null, pos: p.pos,
+                invoiceDate: p.invoiceDate, invoiceValue: p.invoiceValue,
+                centralTax: p.centralTax, stateTax: p.stateTax, integratedTax: p.integratedTax, cess: p.cess,
+                tax: +(p.centralTax + p.stateTax + p.integratedTax + p.cess).toFixed(2),
+                itcAvailable: p.itcAvailable, matchStatus: 'NEW', matchedDocNo: null,
+            });
+            // IMPG lines carry a Bill-of-Entry (as invoiceNum/boe) + IGST instead of a GSTIN.
+            const mkImpgLine = (p) => ({
+                periodId, companyId, section: 'IMPG',
+                supplierGstin: '', supplierName: `Import (BoE ${p.boe})`,
+                invoiceNum: p.boe, normalizedInvoiceNum: p.boe, boe: p.boe, portCode: p.portCode,
+                invoiceType: 'IMPG', noteType: null, pos: '',
+                invoiceDate: p.invoiceDate, invoiceValue: p.taxable, centralTax: 0, stateTax: 0, integratedTax: p.igst, cess: p.cess,
+                tax: +(p.igst + (p.cess || 0)).toFixed(2), igst: p.igst,
+                itcAvailable: '', matchStatus: 'NEW', matchedDocNo: null,
+            });
+            const lineDocs = [
+                ...b2b.map((p) => mkLine(p, 'B2B')),
+                ...cdnr.map((p) => mkLine(p, 'CDNR')),
+                ...impg.map(mkImpgLine),
+            ];
+            insertedCount = lineDocs.length;
+            if (onProgress) onProgress({ phase: 'Parsed 2B — fetching SAP…', current: insertedCount, total: insertedCount });
+            await collections.lines().insertMany(lineDocs);
+        } else if (onProgress) {
+            onProgress({ phase: 'Refreshing — fetching SAP…' });
+        }
 
-        // 3. Build + insert this period's line docs, tagged by section.
-        const mkLine = (p, section) => ({
-            periodId, companyId, section,
-            supplierGstin: p.supplierGstin,
-            supplierName: p.supplierName,
-            invoiceNum: p.invoiceNum,
-            normalizedInvoiceNum: normalizeInvoiceNum(p.invoiceNum),
-            invoiceType: p.invoiceType,
-            noteType: p.noteType || null,
-            pos: p.pos,
-            invoiceDate: p.invoiceDate,
-            invoiceValue: p.invoiceValue,
-            centralTax: p.centralTax,
-            stateTax: p.stateTax,
-            integratedTax: p.integratedTax,
-            cess: p.cess,
-            tax: +(p.centralTax + p.stateTax + p.integratedTax + p.cess).toFixed(2),
-            itcAvailable: p.itcAvailable,
-            matchStatus: 'NEW',
-            matchedDocNo: null,
-        });
-        const lineDocs = [
-            ...b2b.map((p) => mkLine(p, 'B2B')),
-            ...cdnr.map((p) => mkLine(p, 'CDNR')),
-        ];
-        if (onProgress) onProgress(lineDocs.length, lineDocs.length);
-        await collections.lines().insertMany(lineDocs);
-
-        // 4. Rolling window = current + previous FY. Re-match EVERY 2B line in the
-        //    window (all prior periods too, not just this upload) against every SAP
-        //    candidate in the window, so earlier unmatched bills get another chance.
+        // 4. Rolling window = current + previous FY. Match EVERY in-window 2B line (all
+        //    periods) against every in-window SAP candidate.
         const win = fyWindow(month, year);
         const inWin = { $gte: win.start, $lt: win.end };
+
+        // Load the in-window 2B lines up front — they drive both the SAP fetch window
+        // (whole FY) and the matching.
+        const allLines = await collections.lines().find({ companyId, invoiceDate: inWin }).toArray();
+
+        // 3b/fetch. Pull the whole-FY SAP window on-demand → upsert ap_invoices. Guarded:
+        //     a fetch failure does NOT abort — we match against whatever is already stored.
+        let fetchWarning = null;
+        if (SAP_FETCH_ON_RECONCILE) {
+            try {
+                const fwin = fetchWindowFromLines(allLines, month, year);
+                const r = await this.syncSapWindow(companyId, fwin, (m) => {
+                    console.log('  [SAP]', m);
+                    if (onProgress) onProgress({ phase: `SAP: ${m}` });
+                });
+                console.log(`  SAP on-demand fetch: upserted ${r.invoices} invoices for ${r.window.from}–${r.window.to} (${r.failed || 0}/${r.total || 0} calls failed, ${r.cancelledReversed || 0} reversed cancelled)`);
+                if (r.failed) fetchWarning = `SAP data may be incomplete — ${r.failed} of ${r.total} fetch calls failed. Some bills may show as unmatched; re-run to be sure.`;
+            } catch (e) {
+                console.error('  SAP on-demand fetch FAILED (continuing with stored data):', e.message);
+                fetchWarning = `SAP fetch failed (${e.message}) — matched against previously-stored data only.`;
+            }
+        }
+        if (onProgress) onProgress({ phase: 'Matching…' });
 
         // 4a. Deterministic reset of in-window state (idempotent re-run). Auto
         //     reconciliations + adopted GSTINs are cleared; manual matches are kept
@@ -431,15 +629,15 @@ class ReconcileService {
             { companyId, gstinSource: { $in: ['2B', 'RBKP-promoted', 'sibling'] } },
             { $set: { vendorGstin: '', vendorCode: '' }, $unset: { gstinSource: '' } });
 
-        // 4b. Load in-window 2B lines (across ALL periods) and reset them to NEW so
-        //     a line left unmatched this run can't keep a stale prior status.
-        const allLines = await collections.lines().find({ companyId, invoiceDate: inWin }).toArray();
+        // 4b. Reset the in-window lines to NEW so a line left unmatched this run can't keep
+        //     a stale prior status. (allLines is already loaded above.)
         await collections.lines().updateMany(
             { companyId, invoiceDate: inWin },
             { $set: { matchStatus: 'NEW', matchedDocNo: null },
               $unset: { matchCategory: '', matchReason: '', matchStage: '', taxDelta: '', dateDeltaDays: '' } });
         const b2bLines = allLines.filter((l) => (l.section || 'B2B') === 'B2B');
         const cdnrLines = allLines.filter((l) => l.section === 'CDNR');
+        const impgLines = allLines.filter((l) => l.section === 'IMPG');
 
         // 4c. Load in-window candidates (non-cancelled, reconcilable — SA excluded).
         const candidates = await collections.apInvoices()
@@ -483,7 +681,14 @@ class ReconcileService {
         //    credit memos can be signed. KG bills carry docCategory 'CDNR'.
         const kgCands = candidates.filter((c) => c.docCategory === 'CDNR');
         if (cdnrLines.length && kgCands.length) {
-            for (const m of reconcile(cdnrLines, kgCands, { absTax: true }).matches) matches.push({ ...m, stage: 1 });
+            // Note-mode: match on GSTIN + tax + date only (note number ignored).
+            for (const m of reconcile(cdnrLines, kgCands, { absTax: true, noteMode: true }).matches) matches.push({ ...m, stage: 1 });
+        }
+
+        // 6b. IMPG (imports) ↔ SAP customs (SA) docs, matched on Bill-of-Entry no + IGST.
+        const impgCands = candidates.filter((c) => c.docCategory === 'IMPG');
+        if (impgLines.length && impgCands.length) {
+            for (const m of matchImpg(impgLines, impgCands).matches) matches.push({ ...m, stage: 1 });
         }
 
         // 7. Persist. Matched categories reconcile the invoice; near-misses
@@ -537,18 +742,28 @@ class ReconcileService {
         return {
             result: {
                 success: true,
-                message: 'File processed successfully',
+                message: fileBuffer ? 'File processed successfully' : 'Refreshed against current SAP data',
                 periodId: String(periodId),
-                lines: lineDocs.length,
+                lines: fileBuffer ? insertedCount : allLines.length,
                 windowLines: allLines.length,
                 matched: matched.length,
                 dateDiff: matched.filter((m) => m.category === 'Match-DateDiff').length,
                 gstDiff: matches.filter((m) => m.category === 'NotMatch-GstDiff').length,
                 valueDiff: matches.filter((m) => m.category === 'NotMatch-ValueDiff').length,
                 unmatchedBills: unmatchedBills.length,
+                warning: fetchWarning,
             },
             unmatchedBills,
         };
+    }
+
+    /**
+     * GET /refresh — re-reconcile a period's already-stored 2B against CURRENT SAP data
+     * (no re-upload). Picks up bills booked since the last run, drops reversed ones, and
+     * re-evaluates changed amounts. Thin wrapper over importPortalFile with no file.
+     */
+    async refreshPeriod(companyId, month, year, onProgress) {
+        return this.importPortalFile(null, companyId, month, year, null, onProgress);
     }
 
     /** GET /fetch-sap-bills — all unreconciled AP invoices (for the "All" view). */
@@ -642,7 +857,7 @@ class ReconcileService {
      * scoped to a window/month.
      */
     async _matchedRows(companyId, statuses, opts = {}) {
-        const q = { companyId, matchStatus: { $in: statuses } };
+        const q = { companyId, section: { $ne: 'IMPG' }, matchStatus: { $in: statuses } };   // IMPG has its own buckets
         if (opts.win) q.invoiceDate = { $gte: opts.win.start, $lt: opts.win.end };
         const all = await collections.lines().find(q).toArray();
 
@@ -772,21 +987,25 @@ class ReconcileService {
         const nm = { win, m0, y, excludeReconciled: true, vendorByGstin: await this._vendorMap(companyId) };
 
         const [inSapNotIn2b, debitNotes, in2bNotInSap, cdnr2bNotInSap, matched, dateDiff,
-            gstDiff, valueDiff, vendorDiff, noBillNo, manual] = await Promise.all([
+            gstDiff, valueDiff, vendorDiff, noBillNo, manual, impg2b, impgMatched, impgSap] = await Promise.all([
             A.countDocuments({ ...sapBase, docCategory: 'B2B' }),
             A.countDocuments({ ...sapBase, docCategory: 'CDNR' }),
             L.countDocuments({ companyId, section: 'B2B', matchStatus: 'NEW', invoiceDate: dr }),
             L.countDocuments({ companyId, section: 'CDNR', matchStatus: 'NEW', invoiceDate: dr }),
-            L.countDocuments({ companyId, matchStatus: 'Match', invoiceDate: dr }),
-            L.countDocuments({ companyId, matchStatus: 'Match-DateDiff', invoiceDate: dr }),
+            L.countDocuments({ companyId, section: { $ne: 'IMPG' }, matchStatus: 'Match', invoiceDate: dr }),
+            L.countDocuments({ companyId, section: { $ne: 'IMPG' }, matchStatus: 'Match-DateDiff', invoiceDate: dr }),
             this._matchedRows(companyId, ['NotMatch-GstDiff'], nm).then((r) => r.length),
             this._matchedRows(companyId, ['NotMatch-ValueDiff'], nm).then((r) => r.length),
             this._matchedRows(companyId, ['NotMatch-VendorDiff'], nm).then((r) => r.length),
             this._matchedRows(companyId, ['NotMatch-NoBillNo'], nm).then((r) => r.length),
             this.getManuallyMatchedBills(companyId).then((r) => r.count),
+            L.countDocuments({ companyId, section: 'IMPG', matchStatus: 'NEW', invoiceDate: dr }),
+            L.countDocuments({ companyId, section: 'IMPG', matchStatus: { $in: ['Match', 'Match-DateDiff'] }, invoiceDate: dr }),
+            A.countDocuments({ companyId, docCategory: 'IMPG', reconciled: { $ne: true }, docDate: dr, ...hasGst }),
         ]);
         return { period: { month, year: String(year) }, counts: {
             inSapNotIn2b, in2bNotInSap, gstDiff, valueDiff, vendorDiff, noBillNo, debitNotes, cdnr2bNotInSap, matched, dateDiff, manual,
+            impg2b, impgMatched, impgSap,
         } };
     }
 
@@ -835,6 +1054,46 @@ class ReconcileService {
         return lines.map((l) => to2bLineDTO(l, classify2bUnmatched(l, sapIdx)));
     }
 
+    /**
+     * IMPG (imports) rows for three buckets, matched on Bill-of-Entry + IGST:
+     *   'impgsap'     — SAP customs (SA) docs carrying IGST, not reconciled to the 2B
+     *   'impg2b'      — 2B IMPG lines still NEW (import in 2B, no SAP customs doc)
+     *   'impgmatched' — matched pairs, 2B IGST vs SAP IGST side-by-side
+     */
+    async _impgRows(companyId, kind, dr) {
+        const A = collections.apInvoices(), L = collections.lines();
+        if (kind === 'impgsap') {
+            const invs = await A.find({ companyId, docCategory: 'IMPG', reconciled: { $ne: true }, docDate: dr }).toArray();
+            return invs
+                .filter((i) => (Number(i.igst) || Number(i.tax) || 0) > 0)
+                .map((i) => ({
+                    Boe: i.boe || i.normalizedInvoiceNum || '', PortCode: '',
+                    Igst: null, SapIgst: +(Number(i.igst) || Number(i.tax) || 0).toFixed(2),
+                    InvoiceDate: null, SapDate: i.docDate || i.taxDate || null,
+                    SapDocNo: i.docNo, DocEntry: `${i.docNo}|${i.fiscalYear}`,
+                    Status: 'NEW', Source: 'SAP', Reconciled: false,
+                }));
+        }
+        const statuses = kind === 'impgmatched' ? ['Match', 'Match-DateDiff'] : ['NEW'];
+        const lines = await L.find({ companyId, section: 'IMPG', matchStatus: { $in: statuses }, invoiceDate: dr }).toArray();
+        const docNos = [...new Set(lines.map((l) => String(l.matchedDocNo)).filter(Boolean))];
+        const invs = docNos.length ? await A.find({ companyId, docNo: { $in: docNos } }).toArray() : [];
+        const byDoc = new Map(invs.map((i) => [String(i.docNo), i]));
+        return lines.map((l) => {
+            const inv = byDoc.get(String(l.matchedDocNo)) || {};
+            const twoTax = +(Number(l.igst) || Number(l.integratedTax) || 0).toFixed(2);
+            const sapTax = inv.docNo ? +(Number(inv.igst) || Number(inv.tax) || 0).toFixed(2) : null;
+            return {
+                Boe: l.boe || l.invoiceNum || '', PortCode: l.portCode || '',
+                Igst: twoTax, SapIgst: sapTax,
+                InvoiceDate: l.invoiceDate || null, SapDate: inv.docDate || inv.taxDate || null,
+                SapDocNo: inv.docNo || null, DocEntry: inv.docNo ? `${inv.docNo}|${inv.fiscalYear}` : null,
+                TaxDelta: sapTax != null ? +(sapTax - twoTax).toFixed(2) : null,
+                Status: l.matchStatus, Source: '2B', Reconciled: inv.reconciled === true,
+            };
+        });
+    }
+
     /** Group flat bill-DTOs by vendor and return one page of vendor groups (their bills, flat). */
     _vendorPage(rows, page, pageSize) {
         const groups = new Map();   // vendorKey -> bills[]
@@ -880,6 +1139,11 @@ class ReconcileService {
 
         // Manual (row-paged).
         if (key === 'manual') return slice(flt((await this.getManuallyMatchedBills(companyId)).manual, MANUAL_FIELDS));
+
+        // IMPG (imports) — row-paged tables with BoE / IGST columns.
+        if (key === 'impg2b' || key === 'impgsap' || key === 'impgmatched') {
+            return slice(flt(await this._impgRows(companyId, key, dr), ['Boe', 'PortCode', 'SapDocNo']));
+        }
 
         // Matched / near-miss joined tables (row-paged).
         const statusByKey = { matched: 'Match', datediff: 'Match-DateDiff', gstdiff: 'NotMatch-GstDiff', valuediff: 'NotMatch-ValueDiff', vendordiff: 'NotMatch-VendorDiff', nobill: 'NotMatch-NoBillNo' };
