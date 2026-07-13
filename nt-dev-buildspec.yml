@@ -16,7 +16,7 @@ phases:
       - IMAGE_TAG=${COMMIT_HASH:=latest}
 
       - echo Downloading environment file...
-      - aws s3 cp s3://nodejsartifact/matangi-quote-pilot-config/gst-reconciliation/.env .env
+      - aws s3 cp s3://nodejsartifact/nandan-terry-quote-pilot-config/gst-reconciliation/.env .env
 
       - ls -la
 
