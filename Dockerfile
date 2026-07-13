@@ -11,6 +11,11 @@ RUN npm run build
 # ── Stage 2: runtime — Express serves the API + the built client ──────────────
 FROM node:22-alpine
 ENV NODE_ENV=production
+# Cap V8's heap so a reconcile can't grow RSS past the container limit and get OOM-killed.
+# This is a FALLBACK — size it to ~75-80% of the container memory limit. Override per
+# environment via the ECS task definition (environment: NODE_OPTIONS) without a rebuild;
+# a task-def value takes precedence over this ENV.
+ENV NODE_OPTIONS="--max-old-space-size=512"
 WORKDIR /app
 
 # Server production dependencies only.

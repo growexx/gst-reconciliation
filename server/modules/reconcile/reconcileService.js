@@ -395,19 +395,31 @@ function inMonth(d, year, m0) {
     return x.getUTCFullYear() === Number(year) && x.getUTCMonth() === m0;
 }
 
-// Fetch + match window = the reconcile month ± `pad` months (default SAP_FETCH_MONTHS=2),
-// NOT the whole financial year. This bounds SAP fetch volume and memory to a fixed span so
+// Fetch + match window = the reconcile month ± `pad` months (SAP_MATCH_PAD_MONTHS, default
+// 2), NOT the whole financial year. This bounds SAP fetch volume and memory to a fixed span so
 // it stays flat no matter how many years of history accumulate in SAP. `fiscalSegments`
 // splits the range across the Mar↔Apr GJAHR boundary, so a window that crosses fiscal years
 // is fetched correctly. Returns Date bounds (for the docDate match/candidate window) and
 // YYYYMMDD strings (for the SAP API date filter).
+const fmtYmd = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
 function monthPadWindow(month, year, pad) {
     const m0 = monthIndex0(month); const y = Number(year);
-    const base = m0 == null ? 3 : m0;                                  // default April for 'All'/unknown
-    const start = new Date(Date.UTC(y, base - pad, 1));
-    const end = new Date(Date.UTC(y, base + pad + 1, 1));              // exclusive (last day of month+pad)
-    const fmt = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-    return { start, end, from: fmt(start), to: fmt(new Date(end.getTime() - 86400000)) };
+    if (m0 == null) throw new Error(`monthPadWindow needs a specific month, got "${month}"`);
+    const start = new Date(Date.UTC(y, m0 - pad, 1));
+    const end = new Date(Date.UTC(y, m0 + pad + 1, 1));               // exclusive (last day of month+pad)
+    return { start, end, from: fmtYmd(start), to: fmtYmd(new Date(end.getTime() - 86400000)) };
+}
+
+// The single window used for BOTH the SAP fetch/match AND every report/count view, so a
+// report can never claim coverage the matcher didn't attempt. A specific month → that
+// month ± SAP_MATCH_PAD_MONTHS; 'All' → the current + previous FY. Always returns Date
+// bounds (start/end) and YYYYMMDD strings (from/to) for the SAP API.
+function reconcileWindow(month, year) {
+    if (monthIndex0(month) == null) {
+        const w = fyWindow('Apr', year);
+        return { start: w.start, end: w.end, from: fmtYmd(w.start), to: fmtYmd(new Date(w.end.getTime() - 86400000)) };
+    }
+    return monthPadWindow(month, year, Number(process.env.SAP_MATCH_PAD_MONTHS || 2));
 }
 
 class ReconcileService {
@@ -588,11 +600,12 @@ class ReconcileService {
             onProgress({ phase: 'Refreshing — fetching SAP…' });
         }
 
-        // 4. Match window = the reconcile month ± SAP_FETCH_MONTHS (default 2), NOT the whole
-        //    FY — this bounds fetch volume + memory to a fixed span. The month's own views are
-        //    month-scoped (and the month sits mid-window), so they are unaffected; only invoices
-        //    dated more than ±pad months from the reconcile month won't match.
-        const win = monthPadWindow(month, year, Number(process.env.SAP_FETCH_MONTHS || 2));
+        // 4. Match window = the reconcile month ± SAP_MATCH_PAD_MONTHS (default 2), NOT the
+        //    whole FY — bounds fetch volume + memory to a fixed span. The SAME window is used by
+        //    every report/view (reconcileWindow), so views never claim coverage matching didn't
+        //    attempt. Trade-off: a bill dated >±pad months from the reconcile month won't match,
+        //    and prior months don't auto re-match on a new upload — refresh an old month to heal it.
+        const win = reconcileWindow(month, year);
         const inWin = { $gte: win.start, $lt: win.end };
 
         // Load the in-window 2B lines up front — they drive the matching.
@@ -809,7 +822,7 @@ class ReconcileService {
     async getUnmatchedSections(companyId, month = 'Apr', year = '2026') {
         const m0 = monthIndex0(month);                 // null when month = 'All'
         const y = Number(year);
-        const win = fyWindow(m0 == null ? 'Apr' : month, year);   // 2-FY window
+        const win = reconcileWindow(month, year);   // month ± pad (specific month) or 2-FY ('All')
         const inWin = { $gte: win.start, $lt: win.end };
         const monthOk = (d) => (m0 == null) ? true : inMonth(d, y, m0);
 
@@ -936,7 +949,7 @@ class ReconcileService {
     /** GET /matched-bills — reconciled matches: clean (`match`) + date-diff (`dateDiff`). */
     async getMatchedBills(companyId, month = 'Apr', year = '2026') {
         const m0 = monthIndex0(month); const y = Number(year);
-        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const win = reconcileWindow(month, year);
         const match = await this._matchedRows(companyId, ['Match'], { win, m0, y });
         const dateDiff = await this._matchedRows(companyId, ['Match-DateDiff'], { win, m0, y });
         return { period: { month, year: String(year) }, match, dateDiff, matched: match, count: match.length + dateDiff.length };
@@ -945,7 +958,7 @@ class ReconcileService {
     /** GET /tax-mismatch-bills — kept for back-compat; now returns the date-diff matches. */
     async getTaxMismatchBills(companyId, month = 'Apr', year = '2026') {
         const m0 = monthIndex0(month); const y = Number(year);
-        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const win = reconcileWindow(month, year);
         const rows = await this._matchedRows(companyId, ['Match-DateDiff'], { win, m0, y });
         return { period: { month, year: String(year) }, matched: rows, count: rows.length };
     }
@@ -997,7 +1010,7 @@ class ReconcileService {
         const A = collections.apInvoices(), L = collections.lines();
         const dr = this._periodDateRange(month, year);
         const m0 = monthIndex0(month); const y = Number(year);
-        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const win = reconcileWindow(month, year);
         const hasGst = { $expr: { $gt: [{ $add: [{ $ifNull: ['$tax', 0] }, { $ifNull: ['$cgst', 0] }, { $ifNull: ['$sgst', 0] }, { $ifNull: ['$igst', 0] }] }, 0] } };
         const sapBase = { companyId, source: 'BKPF', cancelled: { $ne: true }, reconciled: { $ne: true }, pairCategory: { $in: [null] }, docDate: dr, ...hasGst };
         const nm = { win, m0, y, excludeReconciled: true, vendorByGstin: await this._vendorMap(companyId) };
@@ -1136,7 +1149,7 @@ class ReconcileService {
         page = Math.max(1, Number(page) || 1); pageSize = Math.max(1, Number(pageSize) || 25);
         const dr = this._periodDateRange(month, year);
         const m0 = monthIndex0(month); const y = Number(year);
-        const win = fyWindow(m0 == null ? 'Apr' : month, year);
+        const win = reconcileWindow(month, year);
 
         // Free-text search runs over the FULL bucket (every row, all vendors) before
         // pagination, so a match is found even if it isn't on the current page.

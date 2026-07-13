@@ -116,6 +116,18 @@ canonical invoice-number key everywhere — both the ETL and the importer store 
 as `normalizedInvoiceNum`, and matching/classification use it. Change it in one
 place only (matcher.js) and re-run the ETL if you do.
 
+### Reconcile window (fetch = match = view)
+
+`reconcileWindow(month, year)` is the single window used for the SAP fetch, the matcher,
+and every report/count — so a view never claims coverage matching didn't attempt. A
+specific month → that **month ± `SAP_MATCH_PAD_MONTHS`** (default 2); `'All'` → current +
+previous FY. Narrowing to ±pad (from the old whole-FY window) keeps SAP fetch volume and
+memory **flat** as history grows, at two costs: (1) a bill dated more than ±pad months from
+the reconcile month won't match, and (2) prior months no longer auto re-match on a new
+upload — a bill booked late in SAP heals only when that month is re-run (the "Refresh from
+SAP" button, or a re-upload). SAP is fetched on a 1 GB host, so the heap is capped via
+`NODE_OPTIONS=--max-old-space-size` (Dockerfile ENV / ECS task-def), not in package.json.
+
 ### Unmatched/matched views
 
 After matching, three views are derived (all in reconcileService.js), classified

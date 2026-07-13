@@ -47,6 +47,17 @@ async function ensureIndexes(database) {
         { companyId: 1, vendorGstin: 1, normalizedInvoiceNum: 1 });
     await database.collection('ap_invoices').createIndex(
         { companyId: 1, reconciled: 1, taxDate: 1 });
+    // Support EACH branch of the candidate pre-filter's $or (matcher keys) so a large 2B
+    // upload doesn't collection-scan. vendorGstin is covered by the compound above; these
+    // add the other three. normalizedInvoiceNum needs its OWN index (it can't use the
+    // compound's third key without vendorGstin) — and it's the busiest branch, since
+    // GSTIN-less BKPF bills match by invoice-no (T4).
+    await database.collection('ap_invoices').createIndex({ companyId: 1, normalizedInvoiceNum: 1 });
+    await database.collection('ap_invoices').createIndex({ companyId: 1, rbkpGstin: 1 });
+    await database.collection('ap_invoices').createIndex({ companyId: 1, boe: 1 });
+    // Primary bound for the candidate query: the reconcile ± pad month docDate window.
+    // Keeps the scan proportional to the window, not the whole (growing) collection.
+    await database.collection('ap_invoices').createIndex({ companyId: 1, docDate: 1 });
     await database.collection('users').createIndex({ username: 1 }, { unique: true });
     await database.collection('recon_log').createIndex({ ts: -1 });
 }
