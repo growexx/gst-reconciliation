@@ -233,10 +233,18 @@ async function fetchWindow({ from, to, onProgress } = {}) {
     }
     log(`Fetching details: ${tasks.length} calls (BSET ${sz(apByFy)} docs, BSEG ${sz(bsegByFy)} docs, RBKP ${segs.length})…`);
     const detail = await pool(tasks, CONCURRENCY, async (task) => ({ kind: task.kind, rows: (await task.run()) || [] }));
-    failed += detail.filter((x) => x == null).length; total += detail.length;
-    const by = (k) => detail.filter((d) => d && d.kind === k).flatMap((d) => d.rows);
-    const bset = by('bset'), bseg = by('bseg'), rbkp = by('rbkp');
-    const saImport = { bkpf: saImportRows, bseg: by('saBseg') };
+    total += detail.length;
+    // Consolidate into per-kind arrays in ONE pass, releasing each response as we go so the
+    // raw rows aren't held twice (previously flatMap copied while `detail` stayed alive).
+    const buckets = { bset: [], bseg: [], rbkp: [], saBseg: [] };
+    for (let i = 0; i < detail.length; i++) {
+        const d = detail[i];
+        if (!d) { failed++; continue; }
+        const arr = buckets[d.kind]; if (arr) for (const r of d.rows) arr.push(r);
+        detail[i] = null;   // release so GC can reclaim as we go
+    }
+    const bset = buckets.bset, bseg = buckets.bseg, rbkp = buckets.rbkp;
+    const saImport = { bkpf: saImportRows, bseg: buckets.saBseg };
 
     // Phase C — LFA1 for the distinct vendor codes discovered.
     const vendorCodes = [...new Set([...bseg.map((r) => r['Supplier']), ...rbkp.map((r) => r['Invoicing Party'])]

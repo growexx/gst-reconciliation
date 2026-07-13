@@ -395,25 +395,19 @@ function inMonth(d, year, m0) {
     return x.getUTCFullYear() === Number(year) && x.getUTCMonth() === m0;
 }
 
-// Fetch window = the WHOLE Indian financial year(s) (Apr–Mar) that the uploaded 2B's
-// invoice dates fall in, plus a short tail (SAP_FETCH_MONTHS) past FY-end for bills posted
-// early in the next year. A monthly 2B → that month's full FY; a full-FY "All periods" 2B →
-// the whole year(s) it spans. Falls back to the selected month's FY if lines carry no dates.
-function fetchWindowFromLines(lineDocs, month, year) {
-    const tail = Number(process.env.SAP_FETCH_MONTHS || 2);
-    let loT = Infinity, hiT = -Infinity;
-    for (const l of lineDocs) { const d = l.invoiceDate; if (d instanceof Date && !isNaN(d)) { const t = d.getTime(); if (t < loT) loT = t; if (t > hiT) hiT = t; } }
-    let lo, hi;
-    if (isFinite(loT)) { lo = new Date(loT); hi = new Date(hiT); }
-    else { const m0 = monthIndex0(month); const y = Number(year); lo = new Date(Date.UTC(y, m0 == null ? 3 : m0, 1)); hi = lo; }
-    const fyStartYear = (d) => (d.getUTCMonth() >= 3 ? d.getUTCFullYear() : d.getUTCFullYear() - 1);   // Apr–Mar
-    const fromYear = fyStartYear(lo);            // 1 Apr of the earliest invoice's FY
-    const toFyEndYear = fyStartYear(hi) + 1;     // calendar year of that FY's March
+// Fetch + match window = the reconcile month ± `pad` months (default SAP_FETCH_MONTHS=2),
+// NOT the whole financial year. This bounds SAP fetch volume and memory to a fixed span so
+// it stays flat no matter how many years of history accumulate in SAP. `fiscalSegments`
+// splits the range across the Mar↔Apr GJAHR boundary, so a window that crosses fiscal years
+// is fetched correctly. Returns Date bounds (for the docDate match/candidate window) and
+// YYYYMMDD strings (for the SAP API date filter).
+function monthPadWindow(month, year, pad) {
+    const m0 = monthIndex0(month); const y = Number(year);
+    const base = m0 == null ? 3 : m0;                                  // default April for 'All'/unknown
+    const start = new Date(Date.UTC(y, base - pad, 1));
+    const end = new Date(Date.UTC(y, base + pad + 1, 1));              // exclusive (last day of month+pad)
     const fmt = (d) => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-    return {
-        from: fmt(new Date(Date.UTC(fromYear, 3, 1))),                 // 1 Apr (FY start)
-        to: fmt(new Date(Date.UTC(toFyEndYear, 2 + tail + 1, 0))),     // 31 Mar (FY end) + `tail` months
-    };
+    return { start, end, from: fmt(start), to: fmt(new Date(end.getTime() - 86400000)) };
 }
 
 class ReconcileService {
@@ -459,17 +453,24 @@ class ReconcileService {
      */
     async syncSapWindow(companyId, win, onProgress) {
         const tables = await fetchWindow({ ...win, onProgress });
+        const failed = tables.failed || 0, total = tables.total || 0;
         const { invoices, vendorMaster, reversedKeys } = buildInvoices(tables, companyId);
+        // Free the raw SAP rows now that invoices are built — they dominate memory and are
+        // not needed for the upsert/match. This lets GC reclaim them before the bulk writes,
+        // keeping the peak low enough for a small (1 GB) host.
+        tables.bkpf = tables.bseg = tables.bset = tables.rbkp = tables.lfa1 = tables.saImport = null;
 
-        const invOps = invoices.filter((i) => i.docNo).map((i) => ({
-            updateOne: {
-                filter: { companyId, docNo: i.docNo, fiscalYear: i.fiscalYear },
-                update: { $set: i, $setOnInsert: { reconciled: false, createdAt: new Date() } },
-                upsert: true,
-            },
-        }));
-        for (let k = 0; k < invOps.length; k += 1000) {
-            await collections.apInvoices().bulkWrite(invOps.slice(k, k + 1000), { ordered: false });
+        // Upsert in chunks, building each chunk's ops on the fly (no full parallel ops array).
+        const withDoc = invoices.filter((i) => i.docNo);
+        for (let k = 0; k < withDoc.length; k += 1000) {
+            const ops = withDoc.slice(k, k + 1000).map((i) => ({
+                updateOne: {
+                    filter: { companyId, docNo: i.docNo, fiscalYear: i.fiscalYear },
+                    update: { $set: i, $setOnInsert: { reconciled: false, createdAt: new Date() } },
+                    upsert: true,
+                },
+            }));
+            await collections.apInvoices().bulkWrite(ops, { ordered: false });
         }
 
         const venOps = [];
@@ -493,7 +494,7 @@ class ReconcileService {
         // transient failure (some calls dropped) can never mistake a not-fetched doc for a
         // reversed one and wrongly cancel a live bill.
         let cancelledReversed = 0;
-        if ((tables.failed || 0) === 0 && reversedKeys && reversedKeys.size) {
+        if (failed === 0 && reversedKeys && reversedKeys.size) {
             const revOps = [...reversedKeys].map((k) => {
                 const p = k.lastIndexOf('|');
                 return { updateOne: {
@@ -509,7 +510,7 @@ class ReconcileService {
                 cancelledReversed += res.modifiedCount || 0;
             }
         }
-        return { invoices: invoices.length, vendors: venOps.length, window: win, failed: tables.failed || 0, total: tables.total || 0, cancelledReversed };
+        return { invoices: invoices.length, vendors: venOps.length, window: win, failed, total, cancelledReversed };
     }
 
     /**
@@ -587,21 +588,22 @@ class ReconcileService {
             onProgress({ phase: 'Refreshing — fetching SAP…' });
         }
 
-        // 4. Rolling window = current + previous FY. Match EVERY in-window 2B line (all
-        //    periods) against every in-window SAP candidate.
-        const win = fyWindow(month, year);
+        // 4. Match window = the reconcile month ± SAP_FETCH_MONTHS (default 2), NOT the whole
+        //    FY — this bounds fetch volume + memory to a fixed span. The month's own views are
+        //    month-scoped (and the month sits mid-window), so they are unaffected; only invoices
+        //    dated more than ±pad months from the reconcile month won't match.
+        const win = monthPadWindow(month, year, Number(process.env.SAP_FETCH_MONTHS || 2));
         const inWin = { $gte: win.start, $lt: win.end };
 
-        // Load the in-window 2B lines up front — they drive both the SAP fetch window
-        // (whole FY) and the matching.
+        // Load the in-window 2B lines up front — they drive the matching.
         const allLines = await collections.lines().find({ companyId, invoiceDate: inWin }).toArray();
 
-        // 3b/fetch. Pull the whole-FY SAP window on-demand → upsert ap_invoices. Guarded:
+        // 3b/fetch. Pull the ±pad-month SAP window on-demand → upsert ap_invoices. Guarded:
         //     a fetch failure does NOT abort — we match against whatever is already stored.
         let fetchWarning = null;
         if (SAP_FETCH_ON_RECONCILE) {
             try {
-                const fwin = fetchWindowFromLines(allLines, month, year);
+                const fwin = { from: win.from, to: win.to };
                 const r = await this.syncSapWindow(companyId, fwin, (m) => {
                     console.log('  [SAP]', m);
                     if (onProgress) onProgress({ phase: `SAP: ${m}` });
@@ -639,9 +641,23 @@ class ReconcileService {
         const cdnrLines = allLines.filter((l) => l.section === 'CDNR');
         const impgLines = allLines.filter((l) => l.section === 'IMPG');
 
-        // 4c. Load in-window candidates (non-cancelled, reconcilable — SA excluded).
+        // 4c. Load in-window candidates (non-cancelled, reconcilable — SA excluded), PRE-FILTERED
+        //     to bills that could possibly match a 2B line. Every tier requires the bill to share
+        //     a vendor GSTIN (own or RBKP reserve), a normalized invoice-no, or a Bill-of-Entry
+        //     with some 2B line — so a bill sharing none can never match and is skipped here.
+        //     This keeps only the relevant few thousand (of tens of thousands) in memory. The
+        //     "in SAP, not in 2B" view is computed straight from Mongo, so it is unaffected.
+        const gstinSet = [...new Set(allLines.map((l) => String(l.supplierGstin || '').toUpperCase()).filter(Boolean))];
+        const invNoSet = [...new Set(allLines.map((l) => l.normalizedInvoiceNum).filter(Boolean))];
+        const boeSet = [...new Set(allLines.filter((l) => l.section === 'IMPG').map((l) => l.boe).filter(Boolean))];
+        const candOr = [];
+        if (gstinSet.length) candOr.push({ vendorGstin: { $in: gstinSet } }, { rbkpGstin: { $in: gstinSet } });
+        if (invNoSet.length) candOr.push({ normalizedInvoiceNum: { $in: invNoSet } });
+        if (boeSet.length) candOr.push({ boe: { $in: boeSet } });
+        const candFilter = { companyId, cancelled: { $ne: true }, docCategory: { $ne: 'NONE' }, docDate: inWin };
+        if (candOr.length) candFilter.$or = candOr;
         const candidates = await collections.apInvoices()
-            .find({ companyId, cancelled: { $ne: true }, docCategory: { $ne: 'NONE' }, docDate: inWin })
+            .find(candFilter)
             .sort({ docNo: 1, fiscalYear: 1 })
             .toArray();
         const candByKey = new Map(candidates.map((c) => [`${c.docNo}|${c.fiscalYear}`, c]));
