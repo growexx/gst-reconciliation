@@ -47,6 +47,10 @@ async function ensureIndexes(database) {
         { companyId: 1, vendorGstin: 1, normalizedInvoiceNum: 1 });
     await database.collection('ap_invoices').createIndex(
         { companyId: 1, reconciled: 1, taxDate: 1 });
+    // Support the candidate pre-filter's $or branches (matcher keys) so a large 2B upload
+    // doesn't collection-scan for the RBKP-reserve GSTIN / Bill-of-Entry candidates.
+    await database.collection('ap_invoices').createIndex({ companyId: 1, rbkpGstin: 1 });
+    await database.collection('ap_invoices').createIndex({ companyId: 1, boe: 1 });
     await database.collection('users').createIndex({ username: 1 }, { unique: true });
     await database.collection('recon_log').createIndex({ ts: -1 });
 }
