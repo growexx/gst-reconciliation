@@ -1,0 +1,47 @@
+version: 0.2
+
+env:
+  variables:
+    REPOSITORY_URI: "719056139938.dkr.ecr.us-east-2.amazonaws.com/nandan-terry-emailpilot-gst-prod"
+    S3_BUCKET: "nodejsartifact"
+
+phases:
+  pre_build:
+    commands:
+      - echo $(aws --version)
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin 719056139938.dkr.ecr.us-east-2.amazonaws.com
+
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+
+      - echo Downloading environment file...
+      - aws s3 cp s3://nodejsartifact/nandan-terry-emailpilot-prod-env/gst-reconciliation/.env .env
+
+      - ls -la
+
+  build:
+    commands:
+      - echo Building Docker image...
+      - docker build -t $REPOSITORY_URI:latest -f nt-ep-Dockerfile.prod .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+
+  post_build:
+    commands:
+      - echo Build completed on $(date)
+
+      - echo Pushing Docker images...
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+
+      - echo Writing image definitions file...
+      - printf '[{"name":"nandan-terry-email-pilot-gst-prod","imageUri":"%s"}]' $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+
+cache:
+  paths:
+    - '/var/lib/docker/**/*'
+    - '/root/.cache/docker/**/*'
+
+artifacts:
+  files:
+    - imagedefinitions.json
